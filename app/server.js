@@ -35,7 +35,6 @@ const READ_TIMEOUT_MS = 120000;
 const PAYLOAD_STATUS_CONNECT_TIMEOUT_MS = 5000;
 const PAYLOAD_STATUS_READ_TIMEOUT_MS = 10000;
 const UPLOAD_SOCKET_BUFFER_SIZE = 8 * 1024 * 1024;
-const BINARY_UPLOAD_CHUNK_SIZE = 4 * 1024 * 1024;
 const UploadCmd = {
   StartUpload: 0x10,
   UploadChunk: 0x11,
@@ -1382,101 +1381,11 @@ async function uploadFastOneFile(ip, destRoot, file, options = {}) {
   const shouldCancel = typeof options.shouldCancel === 'function' ? options.shouldCancel : null;
   const onProgress = typeof options.onProgress === 'function' ? options.onProgress : null;
   const chmodAfterUpload = Boolean(options.chmodAfterUpload);
-
-  // PS5-Upload-Suite core invariant: don't allow parallel writes into the same remote file.
-  // Users can still create weird queue combinations; enforce it here.
-  const remotePath = joinRemotePath(destRoot, file.rel_path);
-  const releaseRemote = await remoteFileMutex.acquire(remotePath);
-  try {
-    return await retryWithBackoff(
-      async () => uploadFastOneFileOnce(ip, remotePath, file, { shouldCancel, onProgress, chmodAfterUpload }),
-      {
-        maxAttempts: Math.max(1, Math.min(4, Number(options.maxAttempts) || 2)),
-        shouldRetry: isRetryableNetworkError,
-        shouldCancel,
-      }
-    );
-  } finally {
-    releaseRemote();
-  }
-}
-
-function createKeyedMutex() {
-  const state = new Map(); // key -> { locked: boolean, waiters: Array<() => void> }
-  const acquire = async (key) => {
-    const k = String(key || '');
-    if (!k) {
-      return () => {};
-    }
-    let slot = state.get(k);
-    if (!slot) {
-      slot = { locked: false, waiters: [] };
-      state.set(k, slot);
-    }
-    while (slot.locked) {
-      await new Promise((resolve) => slot.waiters.push(resolve));
-    }
-    slot.locked = true;
-    let released = false;
-    return () => {
-      if (released) return;
-      released = true;
-      // Release then wake exactly one waiter. (If we keep locked=true, the waiter
-      // will re-enter the wait loop and deadlock.)
-      slot.locked = false;
-      const next = slot.waiters.shift();
-      if (next) next();
-      else state.delete(k);
-    };
-  };
-  return { acquire };
-}
-
-const remoteFileMutex = createKeyedMutex();
-
-function sleepMs(ms) {
-  return new Promise((resolve) => setTimeout(resolve, Math.max(0, Number(ms) || 0)));
-}
-
-function isRetryableNetworkError(err) {
-  const code = err && err.code ? String(err.code) : '';
-  if (['ECONNRESET', 'EPIPE', 'ETIMEDOUT', 'ECONNREFUSED', 'EHOSTUNREACH', 'ENETUNREACH', 'EAI_AGAIN'].includes(code)) {
-    return true;
-  }
-  const msg = err && err.message ? String(err.message) : String(err || '');
-  return /(ECONNRESET|EPIPE|ETIMEDOUT|EAI_AGAIN|socket hang up|timed out|timeout|Connection closed)/i.test(msg);
-}
-
-async function retryWithBackoff(fn, opts = {}) {
-  const maxAttempts = Math.max(1, Number(opts.maxAttempts) || 1);
-  const shouldRetry = typeof opts.shouldRetry === 'function' ? opts.shouldRetry : null;
-  const shouldCancel = typeof opts.shouldCancel === 'function' ? opts.shouldCancel : null;
-  let attempt = 0;
-  let lastErr = null;
-  while (attempt < maxAttempts) {
-    if (shouldCancel && shouldCancel()) throw new Error('Transfer cancelled');
-    attempt += 1;
-    try {
-      return await fn(attempt);
-    } catch (err) {
-      lastErr = err;
-      if (attempt >= maxAttempts) break;
-      if (shouldCancel && shouldCancel()) throw err;
-      if (shouldRetry && !shouldRetry(err)) throw err;
-      const delay = Math.min(2000, 250 * Math.pow(2, attempt - 1));
-      await sleepMs(delay);
-    }
-  }
-  throw lastErr || new Error('Retry failed');
-}
-
-async function uploadFastOneFileOnce(ip, remotePath, file, options = {}) {
-  const shouldCancel = typeof options.shouldCancel === 'function' ? options.shouldCancel : null;
-  const onProgress = typeof options.onProgress === 'function' ? options.onProgress : null;
   const socket = await createSocketWithTimeout(ip, TRANSFER_PORT);
   tuneUploadSocket(socket);
   const reader = createSocketReader(socket);
   try {
+    const remotePath = joinRemotePath(destRoot, file.rel_path);
     const startPayload = buildUploadStartPayload(remotePath, file.size, 0);
     await writeBinaryCommand(socket, UploadCmd.StartUpload, startPayload);
     const readyResp = await readBinaryResponse(reader, READ_TIMEOUT_MS);
@@ -1484,33 +1393,40 @@ async function uploadFastOneFileOnce(ip, remotePath, file, options = {}) {
       const msg = readyResp.data?.length ? readyResp.data.toString('utf8') : 'no response';
       throw new Error(`Upload rejected: ${msg}`);
     }
-    if (Number(file.size) > 0) {
-      const fd = await fs.promises.open(file.abs_path, 'r');
-      try {
-        const buf = Buffer.allocUnsafe(5 + BINARY_UPLOAD_CHUNK_SIZE);
-        let remaining = Number(file.size);
-        let pos = 0;
-        while (remaining > 0) {
-          if (shouldCancel && shouldCancel()) throw new Error('Transfer cancelled');
-          const take = Math.min(buf.length - 5, remaining);
-          const { bytesRead } = await fd.read(buf, 5, take, pos);
-          if (bytesRead <= 0) throw new Error('Read failed');
+           if (Number(file.size) > 0) {
+             const fd = await fs.promises.open(file.abs_path, 'r');
+             try {
+               const buf = Buffer.allocUnsafe(5 + 8 * 1024 * 1024);
+               let remaining = Number(file.size);
+               let pos = 0;
+               while (remaining > 0) {
+                 if (shouldCancel && shouldCancel()) throw new Error('Transfer cancelled');
+                 const take = Math.min(buf.length - 5, remaining);
+                 const { bytesRead } = await fd.read(buf, 5, take, pos);
+                 if (bytesRead <= 0) throw new Error('Read failed');
           buf[0] = UploadCmd.UploadChunk;
-          buf.writeUInt32LE(bytesRead, 1);
-          await writeAll(socket, buf.subarray(0, 5 + bytesRead));
-          remaining -= bytesRead;
-          pos += bytesRead;
-          if (onProgress) onProgress(bytesRead);
-        }
-      } finally {
-        await fd.close().catch(() => {});
-      }
-    }
+                 buf.writeUInt32LE(bytesRead, 1);
+                 await writeAll(socket, buf.subarray(0, 5 + bytesRead));
+                 remaining -= bytesRead;
+                 pos += bytesRead;
+                 if (onProgress) onProgress(bytesRead);
+               }
+             } finally {
+               await fd.close().catch(() => {});
+             }
+           }
     await writeBinaryCommand(socket, UploadCmd.EndUpload, Buffer.alloc(0));
     const endResp = await readBinaryResponse(reader, READ_TIMEOUT_MS);
     if (endResp.code !== UploadResp.Ok) {
       const msg = endResp.data?.length ? endResp.data.toString('utf8') : 'unknown response';
       throw new Error(`Upload failed: ${msg}`);
+    }
+    if (chmodAfterUpload) {
+      try {
+        await chmod777(ip, TRANSFER_PORT, remotePath);
+      } catch {
+        // non-fatal
+      }
     }
     return true;
   } finally {
@@ -1530,21 +1446,59 @@ async function uploadFastMultiFile(ip, destRoot, files, options = {}) {
   const queue = Array.isArray(files) ? [...files] : [];
   let totalSent = 0;
 
+  let laneLocked = false;
+  let laneWaiters = [];
+  const acquireLaneLock = async () => {
+    while (laneLocked) {
+      await new Promise((resolve) => laneWaiters.push(resolve));
+    }
+    laneLocked = true;
+  };
+  const releaseLaneLock = () => {
+    laneLocked = false;
+    const waiters = laneWaiters;
+    laneWaiters = [];
+    for (const resolve of waiters) resolve();
+  };
+  const waitIfLaneBusy = async () => {
+    while (laneLocked) {
+      await new Promise((resolve) => laneWaiters.push(resolve));
+    }
+  };
+
   const runWorker = async () => {
     while (queue.length > 0) {
       if (shouldCancel && shouldCancel()) throw new Error('Transfer cancelled');
+      await waitIfLaneBusy();
       const file = queue.shift();
       if (!file) continue;
       if (onFileStart) onFileStart(file);
-      // Stability default: avoid parallel offset writes into a single remote file.
-      await uploadFastOneFile(ip, destRoot, file, {
-        shouldCancel,
-        chmodAfterUpload,
-        onProgress: (delta) => {
-          totalSent += delta;
-          if (onProgress) onProgress(totalSent, file);
-        },
-      });
+      if (Number(file.size || 0) >= LANE_MIN_FILE_SIZE) {
+        await acquireLaneLock();
+        try {
+          const laneBaseBytes = totalSent;
+          await uploadLaneSingleFile(ip, destRoot, file, {
+            connections,
+            shouldCancel,
+            chmodAfterUpload,
+            onProgress: (sent) => {
+              totalSent = laneBaseBytes + sent;
+              if (onProgress) onProgress(totalSent, file);
+            },
+          });
+        } finally {
+          releaseLaneLock();
+        }
+      } else {
+        await uploadFastOneFile(ip, destRoot, file, {
+          shouldCancel,
+          chmodAfterUpload,
+          onProgress: (delta) => {
+            totalSent += delta;
+            if (onProgress) onProgress(totalSent, file);
+          },
+        });
+      }
       if (onFileDone) onFileDone(file);
     }
   };
@@ -1560,9 +1514,6 @@ async function uploadLaneSingleFile(ip, destRoot, file, options = {}) {
   const connections = Math.max(1, Math.min(8, Number(options.connections) || LANE_CONNECTIONS));
   const totalSize = Number(file.size || 0);
   if (totalSize <= 0) return;
-  const remotePath = joinRemotePath(destRoot, file.rel_path);
-  const releaseRemote = await remoteFileMutex.acquire(remotePath);
-  try {
   const chunkSize = getLaneChunkSize(totalSize);
   const chunks = [];
   for (let offset = 0; offset < totalSize; offset += chunkSize) {
@@ -1597,6 +1548,7 @@ async function uploadLaneSingleFile(ip, destRoot, file, options = {}) {
         if (shouldCancel && shouldCancel()) throw new Error('Transfer cancelled');
         if (chunk.offset !== 0) await waitForPrealloc();
 
+        const remotePath = joinRemotePath(destRoot, file.rel_path);
         const startPayload = buildUploadStartPayload(remotePath, totalSize, chunk.offset);
         await writeBinaryCommand(socket, UploadCmd.StartUpload, startPayload);
         const readyResp = await readBinaryResponse(reader, READ_TIMEOUT_MS);
@@ -1611,7 +1563,7 @@ async function uploadLaneSingleFile(ip, destRoot, file, options = {}) {
 
         let remaining = chunk.len;
         let pos = chunk.offset;
-        const buf = Buffer.allocUnsafe(5 + BINARY_UPLOAD_CHUNK_SIZE);
+        const buf = Buffer.allocUnsafe(5 + 8 * 1024 * 1024);
         while (remaining > 0) {
           if (shouldCancel && shouldCancel()) throw new Error('Transfer cancelled');
           const take = Math.min(buf.length - 5, remaining);
@@ -1651,9 +1603,6 @@ async function uploadLaneSingleFile(ip, destRoot, file, options = {}) {
   };
 
   await Promise.all(activeQueues.map((queue, idx) => runWorker(queue, idx)));
-  } finally {
-    releaseRemote();
-  }
 }
 
 async function uploadFilesViaFtpSimple(ip, ftpPort, destRoot, files, options = {}) {
@@ -1775,7 +1724,7 @@ async function uploadRarForExtractionViaPayload(ip, rarPath, destPath, opts = {}
 
     const fd = await fs.promises.open(rarPath, 'r');
     try {
-      const buf = Buffer.allocUnsafe(BINARY_UPLOAD_CHUNK_SIZE);
+      const buf = Buffer.allocUnsafe(8 * 1024 * 1024);
       let remaining = fileSize;
       let pos = 0;
       let sent = 0;
@@ -3353,11 +3302,15 @@ async function handleInvoke(cmd, args, runtime) {
           // Stability first: cap payload concurrency at 4 to avoid overwhelming the PS5 side.
           effectivePayloadConnections = Math.max(1, Math.min(4, effectivePayloadConnections));
 
-          // Match desktop Manage Upload defaults:
-          // - Stability default: do not use parallel offset writes for a single remote file.
-          // - Use up to 4 workers for payload multi-file uploads.
+          // Match desktop Manage Upload defaults (ipcMain.handle('manage_upload')):
+          // - For a big single file: use the lane path with 4 connections.
+          // - Otherwise: use up to 4 workers for payload multi-file uploads.
           if (cmd === 'manage_upload' && mode === 'payload') {
-            effectivePayloadConnections = Math.max(1, Math.min(4, uploadFiles.length));
+            if (uploadFiles.length === 1 && Number(uploadFiles[0].size || 0) >= LANE_MIN_FILE_SIZE) {
+              effectivePayloadConnections = 4;
+            } else {
+              effectivePayloadConnections = Math.max(1, Math.min(4, uploadFiles.length));
+            }
           }
 
           if (mode === 'payload') {
@@ -3374,19 +3327,15 @@ async function handleInvoke(cmd, args, runtime) {
             runtime.transferStatus.status = 'Uploading';
             runtime.transferStatus.current_file = '';
 
-              if (uploadFiles.length === 1) {
-                // Stability default: avoid parallel offset writes into a single remote file.
-                await uploadFastMultiFile(ip, destRoot, uploadFiles, {
-                  connections: 1,
+              if (uploadFiles.length === 1 && Number(uploadFiles[0].size || 0) >= LANE_MIN_FILE_SIZE) {
+                await uploadLaneSingleFile(ip, destRoot, uploadFiles[0], {
+                  connections: effectivePayloadConnections,
                   shouldCancel: () => runtime.transferCancel,
-                  onFileStart: (file) => {
-                    runtime.transferStatus.current_file = file && file.rel_path ? file.rel_path : '';
-                  },
-                  onProgress: (sent, file) => {
+                  onProgress: (sent) => {
                     runtime.transferStatus.sent = sent;
                     recordTransferSpeed(runtime, sent, 'payload');
                     runtime.transferStatus.elapsed_secs = (Date.now() - startedAt) / 1000;
-                    runtime.transferStatus.current_file = file && file.rel_path ? file.rel_path : runtime.transferStatus.current_file;
+                    runtime.transferStatus.current_file = uploadFiles[0].rel_path || '';
                   },
                 });
               } else {
@@ -3394,13 +3343,12 @@ async function handleInvoke(cmd, args, runtime) {
                   connections: effectivePayloadConnections,
                   shouldCancel: () => runtime.transferCancel,
                   onFileStart: (file) => {
-                    runtime.transferStatus.current_file = file && file.rel_path ? file.rel_path : '';
+                    runtime.transferStatus.current_file = file.rel_path || '';
                   },
-                  onProgress: (sent, file) => {
+                  onProgress: (sent) => {
                     runtime.transferStatus.sent = sent;
                     recordTransferSpeed(runtime, sent, 'payload');
                     runtime.transferStatus.elapsed_secs = (Date.now() - startedAt) / 1000;
-                    runtime.transferStatus.current_file = file && file.rel_path ? file.rel_path : runtime.transferStatus.current_file;
                   },
                 });
               }
@@ -3616,22 +3564,37 @@ async function handleInvoke(cmd, args, runtime) {
             },
           });
         } else {
-          // Stability default: archives are single files; always use one stream.
-          let sent = 0;
-          await uploadFastOneFile(ip, remoteDir, {
-            rel_path: path.basename(rarPath),
-            abs_path: rarPath,
-            size: stat.size,
-          }, {
-            shouldCancel: () => runtime.manageCancel,
-            onProgress: (delta) => {
-              sent += Number(delta) || 0;
-              runtime.transferStatus.sent = sent;
-              recordTransferSpeed(runtime, sent, 'payload');
-              runtime.transferStatus.elapsed_secs = (Date.now() - startedAt) / 1000;
-              runtime.transferStatus.current_file = path.basename(rarPath);
-            },
-          });
+          if (Number(stat.size) >= LANE_MIN_FILE_SIZE) {
+            await uploadLaneSingleFile(ip, remoteDir, {
+              rel_path: path.basename(rarPath),
+              abs_path: rarPath,
+              size: stat.size,
+            }, {
+              shouldCancel: () => runtime.manageCancel,
+              onProgress: (sent) => {
+                runtime.transferStatus.sent = sent;
+                recordTransferSpeed(runtime, sent, 'payload');
+                runtime.transferStatus.elapsed_secs = (Date.now() - startedAt) / 1000;
+                runtime.transferStatus.current_file = path.basename(rarPath);
+              },
+            });
+          } else {
+            let sent = 0;
+            await uploadFastOneFile(ip, remoteDir, {
+              rel_path: path.basename(rarPath),
+              abs_path: rarPath,
+              size: stat.size,
+            }, {
+              shouldCancel: () => runtime.manageCancel,
+              onProgress: (delta) => {
+                sent += Number(delta) || 0;
+                runtime.transferStatus.sent = sent;
+                recordTransferSpeed(runtime, sent, 'payload');
+                runtime.transferStatus.elapsed_secs = (Date.now() - startedAt) / 1000;
+                runtime.transferStatus.current_file = path.basename(rarPath);
+              },
+            });
+          }
         }
 
         const queuedId = await queueExtract(ip, TRANSFER_PORT, remoteRarPath, destPath, { deleteSource: true });
