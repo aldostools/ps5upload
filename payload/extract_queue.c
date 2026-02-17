@@ -58,6 +58,7 @@ typedef struct {
     int extracted_count;
     unsigned long long extracted_bytes;
     unsigned long long scanned_total_size;
+    int selected_unrar_mode;
 } ExtractWorkerResult;
 
 #define EXTRACT_QUEUE_FILE "/data/ps5upload/extract_queue.bin"
@@ -84,6 +85,8 @@ static void extract_queue_touch(void);
 static void extract_queue_save_locked(void);
 static void extract_queue_load(void);
 static ExtractQueueItem *extract_queue_find_item_by_id_locked(int id, int *idx_out);
+static int choose_unrar_mode_auto(int file_count, unsigned long long total_size);
+static const char *queue_unrar_mode_label(int mode);
 
 void extract_queue_init(void) {
     pthread_mutex_lock(&g_queue_mutex);
@@ -139,8 +142,8 @@ int extract_queue_add(const char *source_path, const char *dest_path, int delete
     }
     item->delete_source = delete_source ? 1 : 0;
     strncpy(item->archive_name, get_archive_name(source_path), sizeof(item->archive_name) - 1);
-    if (unrar_mode < EXTRACT_RAR_FAST || unrar_mode > EXTRACT_RAR_TURBO) {
-        item->unrar_mode = EXTRACT_RAR_TURBO;
+    if (unrar_mode < EXTRACT_RAR_FAST || unrar_mode > EXTRACT_RAR_AUTO) {
+        item->unrar_mode = EXTRACT_RAR_AUTO;
     } else {
         item->unrar_mode = unrar_mode;
     }
@@ -387,6 +390,7 @@ static int run_extract_job_in_worker_process(const char *source,
                                              int unrar_mode,
                                              int *out_was_cancelled,
                                              int *out_extract_result,
+                                             int *out_selected_unrar_mode,
                                              int *out_chmod_result,
                                              int *out_extracted_count,
                                              unsigned long long *out_extracted_bytes,
@@ -421,8 +425,10 @@ static int run_extract_job_in_worker_process(const char *source,
         result.extracted_count = 0;
         result.extracted_bytes = 0;
         result.scanned_total_size = 0;
+        result.selected_unrar_mode = unrar_mode;
 
-        int use_scan = (unrar_mode == EXTRACT_RAR_SAFE);
+        int resolved_mode = unrar_mode;
+        int use_scan = (unrar_mode == EXTRACT_RAR_SAFE || unrar_mode == EXTRACT_RAR_AUTO);
         if (use_scan) {
             int file_count = 0;
             unsigned long long total_size = 0;
@@ -433,16 +439,20 @@ static int run_extract_job_in_worker_process(const char *source,
                 close(fds[1]);
                 _exit(11);
             }
+            if (unrar_mode == EXTRACT_RAR_AUTO) {
+                resolved_mode = choose_unrar_mode_auto(file_count, total_size);
+            }
         }
+        result.selected_unrar_mode = resolved_mode;
 
         unrar_extract_opts opts;
-        if (unrar_mode == EXTRACT_RAR_SAFE) {
+        if (resolved_mode == EXTRACT_RAR_SAFE) {
             opts.keepalive_interval_sec = UNRAR_SAFE_KEEPALIVE_SEC;
             opts.sleep_every_bytes = UNRAR_SAFE_SLEEP_EVERY_BYTES;
             opts.sleep_us = UNRAR_SAFE_SLEEP_US;
             opts.trust_paths = UNRAR_SAFE_TRUST_PATHS;
             opts.progress_file_start = UNRAR_SAFE_PROGRESS_FILE_START;
-        } else if (unrar_mode == EXTRACT_RAR_FAST) {
+        } else if (resolved_mode == EXTRACT_RAR_FAST) {
             opts.keepalive_interval_sec = UNRAR_FAST_KEEPALIVE_SEC;
             opts.sleep_every_bytes = UNRAR_FAST_SLEEP_EVERY_BYTES;
             opts.sleep_us = UNRAR_FAST_SLEEP_US;
@@ -456,7 +466,7 @@ static int run_extract_job_in_worker_process(const char *source,
             opts.progress_file_start = UNRAR_TURBO_PROGRESS_FILE_START;
         }
 
-        unsigned long long progress_total = use_scan ? result.scanned_total_size : 0;
+        unsigned long long progress_total = (resolved_mode == EXTRACT_RAR_SAFE) ? result.scanned_total_size : 0;
         result.extract_result = unrar_extract(source, dest, 0, progress_total, &opts,
                                               extraction_progress_callback_child, NULL,
                                               &result.extracted_count, &result.extracted_bytes);
@@ -513,6 +523,7 @@ static int run_extract_job_in_worker_process(const char *source,
 
     if (out_was_cancelled) *out_was_cancelled = was_cancelled;
     if (out_extract_result) *out_extract_result = result.extract_result;
+    if (out_selected_unrar_mode) *out_selected_unrar_mode = result.selected_unrar_mode;
     if (out_chmod_result) *out_chmod_result = result.chmod_result;
     if (out_extracted_count) *out_extracted_count = result.extracted_count;
     if (out_extracted_bytes) *out_extracted_bytes = result.extracted_bytes;
@@ -537,13 +548,13 @@ static int run_extract_job_in_worker_process(const char *source,
 
     if (result.scan_result != UNRAR_OK) {
         if (out_err && out_err_len > 0) {
-            snprintf(out_err, out_err_len, "scan failed: %s", unrar_strerror(result.scan_result));
+            snprintf(out_err, out_err_len, "ERR_RAR_SCAN: %s", unrar_strerror(result.scan_result));
         }
         return -1;
     }
     if (result.extract_result != UNRAR_OK) {
         if (out_err && out_err_len > 0) {
-            snprintf(out_err, out_err_len, "extract failed: %s", unrar_strerror(result.extract_result));
+            snprintf(out_err, out_err_len, "ERR_RAR_EXTRACT: %s", unrar_strerror(result.extract_result));
         }
         return -1;
     }
@@ -573,6 +584,7 @@ static void *extract_thread_func(void *arg) {
     ExtractQueueItem *item = &g_queue.items[index];
     int item_id = item->id;
     int item_unrar_mode = item->unrar_mode;
+    int resolved_unrar_mode = item_unrar_mode;
     int item_delete_source = item->delete_source;
     char source[EXTRACT_QUEUE_PATH_MAX];
     char dest[EXTRACT_QUEUE_PATH_MAX];
@@ -601,6 +613,8 @@ static void *extract_thread_func(void *arg) {
     printf("[EXTRACT_QUEUE] Starting extraction: %s -> %s\n", source, dest);
     if (item_unrar_mode == EXTRACT_RAR_TURBO) {
         printf("[EXTRACT_QUEUE] Turbo mode: per-file progress updates disabled; totals may be unavailable\n");
+    } else if (item_unrar_mode == EXTRACT_RAR_AUTO) {
+        printf("[EXTRACT_QUEUE] Auto mode: scan profile will select extract mode\n");
     }
 
 
@@ -611,7 +625,7 @@ static void *extract_thread_func(void *arg) {
         if (locked_item) {
             locked_item->status = EXTRACT_STATUS_FAILED;
             locked_item->completed_at = time(NULL);
-            snprintf(locked_item->error_msg, sizeof(locked_item->error_msg), "Create dest failed: %s", strerror(errno));
+            snprintf(locked_item->error_msg, sizeof(locked_item->error_msg), "ERR_RAR_DEST: %s", strerror(errno));
         }
         g_queue.current_index = -1;
         atomic_store(&g_thread_running, 0);
@@ -630,6 +644,7 @@ static void *extract_thread_func(void *arg) {
     unsigned long long extracted_bytes = 0;
     unsigned long long scanned_total_size = 0;
     int extract_result = UNRAR_OK;
+    int selected_unrar_mode = item_unrar_mode;
     int chmod_result = 0;
     int was_cancelled = 0;
     char worker_err[256];
@@ -641,6 +656,7 @@ static void *extract_thread_func(void *arg) {
         item_unrar_mode,
         &was_cancelled,
         &extract_result,
+        &selected_unrar_mode,
         &chmod_result,
         &extracted_count,
         &extracted_bytes,
@@ -648,14 +664,18 @@ static void *extract_thread_func(void *arg) {
         worker_err,
         sizeof(worker_err));
 
-    if (item_unrar_mode == EXTRACT_RAR_SAFE && scanned_total_size > 0) {
+    resolved_unrar_mode = selected_unrar_mode;
+    if (scanned_total_size > 0 && (item_unrar_mode == EXTRACT_RAR_SAFE || item_unrar_mode == EXTRACT_RAR_AUTO)) {
         pthread_mutex_lock(&g_queue_mutex);
         ExtractQueueItem *locked_item = extract_queue_find_item_by_id_locked(item_id, NULL);
         if (locked_item) {
+            locked_item->unrar_mode = resolved_unrar_mode;
             locked_item->total_bytes = scanned_total_size;
         }
         pthread_mutex_unlock(&g_queue_mutex);
     }
+
+    printf("[EXTRACT_QUEUE] Mode selected for item %d: %s\n", item_id, queue_unrar_mode_label(resolved_unrar_mode));
 
     pthread_mutex_lock(&g_queue_mutex);
     ExtractQueueItem *locked_item = extract_queue_find_item_by_id_locked(item_id, NULL);
@@ -674,15 +694,15 @@ static void *extract_thread_func(void *arg) {
                 locked_item->error_msg[0] = '\0';
             } else {
                 locked_item->status = EXTRACT_STATUS_FAILED;
-                snprintf(locked_item->error_msg, sizeof(locked_item->error_msg), "Cancelled");
+                snprintf(locked_item->error_msg, sizeof(locked_item->error_msg), "ERR_RAR_CANCELLED");
             }
         } else if (worker_rc != 0) {
             locked_item->status = EXTRACT_STATUS_FAILED;
-            snprintf(locked_item->error_msg, sizeof(locked_item->error_msg), "Worker failed: %s",
+            snprintf(locked_item->error_msg, sizeof(locked_item->error_msg), "ERR_RAR_WORKER: %s",
                      worker_err[0] ? worker_err : "unknown");
         } else if (extract_result != UNRAR_OK) {
             locked_item->status = EXTRACT_STATUS_FAILED;
-            snprintf(locked_item->error_msg, sizeof(locked_item->error_msg), "Extract failed: %s", unrar_strerror(extract_result));
+            snprintf(locked_item->error_msg, sizeof(locked_item->error_msg), "ERR_RAR_EXTRACT: %s", unrar_strerror(extract_result));
         } else {
             if (chmod_result != 0) {
                 printf("[EXTRACT_QUEUE] Warning: chmod failed for %s\n", dest);
@@ -724,6 +744,29 @@ static void *extract_thread_func(void *arg) {
     extract_queue_process();
 
     return NULL;
+}
+
+static int choose_unrar_mode_auto(int file_count, unsigned long long total_size) {
+    if (file_count > 0 && total_size > 0) {
+        unsigned long long avg_size = total_size / (unsigned long long)file_count;
+        if (file_count >= 8000 || avg_size <= (256ULL * 1024ULL)) {
+            return EXTRACT_RAR_SAFE;
+        }
+    }
+    if (total_size >= (8ULL * 1024ULL * 1024ULL * 1024ULL) || file_count <= 256) {
+        return EXTRACT_RAR_TURBO;
+    }
+    return EXTRACT_RAR_FAST;
+}
+
+static const char *queue_unrar_mode_label(int mode) {
+    switch (mode) {
+        case EXTRACT_RAR_FAST: return "FAST";
+        case EXTRACT_RAR_SAFE: return "SAFE";
+        case EXTRACT_RAR_TURBO: return "TURBO";
+        case EXTRACT_RAR_AUTO: return "AUTO";
+        default: return "UNKNOWN";
+    }
 }
 
 static int mkdir_recursive_queue(const char *path) {

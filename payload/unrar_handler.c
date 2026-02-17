@@ -35,7 +35,7 @@ static char g_last_mkdir_err[256];
 static int g_last_mkdir_errno;
 
 /* Helper to reliably send data */
-static void send_all(int sock, const char *data) {
+static int send_all(int sock, const char *data) {
     size_t len = strlen(data);
     size_t sent = 0;
     time_t last_ok = time(NULL);
@@ -44,17 +44,21 @@ static void send_all(int sock, const char *data) {
         if (n < 0) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
                 if (time(NULL) - last_ok > 10) {
-                    break;
+                    return -1;
                 }
                 usleep(1000);
                 continue;
             }
-            break; 
+            return -1;
+        }
+        if (n == 0) {
+            return -1;
         }
         sent += n;
         last_ok = time(NULL);
         payload_touch_activity();
     }
+    return 0;
 }
 
 static void get_storage_root(const char *dest_path, char *out, size_t out_len) {
@@ -465,7 +469,6 @@ int extract_rar_file(const char *rar_path, const char *dest_dir, int strip_root,
 }
 
 void handle_upload_rar(int sock, const char *args, UnrarMode mode) {
-    mode = UNRAR_MODE_TURBO;
     char dest_path[PATH_MAX];
     unsigned long long file_size = 0;
     int allow_overwrite = 1;

@@ -6,9 +6,28 @@ const path = require('path');
 const http = require('http');
 const https = require('https');
 const net = require('net');
+const crypto = require('crypto');
 const { spawn, spawnSync } = require('child_process');
 const { URL } = require('url');
 const { getRuntimeConfig } = require('../shared/runtime-config');
+const transferCore = require('../shared/transfer-core');
+const sharedTransferConstants = require('../shared/transfer-constants');
+const sharedPayloadCaps = require('../shared/payload-caps');
+const sharedResumeHash = require('../shared/resume-hash');
+const sharedPayloadRpc = require('../shared/payload-rpc');
+const sharedPayloadQueueApi = require('../shared/payload-queue-api');
+const sharedResumeScan = require('../shared/resume-scan');
+const sharedPayloadUploadCore = require('../shared/payload-upload-core');
+const sharedPayloadFsApi = require('../shared/payload-fs-api');
+const sharedRemotePathUtils = require('../shared/remote-path-utils');
+const sharedGameMeta = require('../shared/game-meta');
+const sharedPayloadFileUtils = require('../shared/payload-file-utils');
+const sharedClientRuntimeHelpers = require('../shared/client-runtime-helpers');
+const sharedClientPersistence = require('../shared/client-persistence');
+const sharedAsyncUtils = require('../shared/async-utils');
+const sharedLocalFileScan = require('../shared/local-file-scan');
+const sharedPayloadRemoteHelpers = require('../shared/payload-remote-helpers');
+const sharedKeyedMutex = require('../shared/keyed-mutex');
 
 function tryRequire(moduleName) {
   try {
@@ -21,6 +40,24 @@ function tryRequire(moduleName) {
   }
 }
 const ftp = tryRequire('basic-ftp');
+const undici = tryRequire('undici');
+const hashWasm = tryRequire('hash-wasm');
+const createDefaultPayloadCaps = sharedPayloadCaps.createDefaultPayloadCaps;
+const normalizePayloadCaps = sharedPayloadCaps.normalizePayloadCaps;
+const commandForRemoteHashAlgorithm = sharedResumeHash.commandForRemoteHashAlgorithm;
+const chooseResumeHashAlgorithm = sharedResumeHash.chooseResumeHashAlgorithm;
+const isRemoteDirEntry = sharedResumeScan.isRemoteDirEntry;
+const escapeCommandPath = sharedRemotePathUtils.escapeCommandPath;
+const joinRemotePath = sharedRemotePathUtils.joinRemotePath;
+const joinRemoteScanPath = sharedRemotePathUtils.joinRemoteScanPath;
+const normalizeRemoteScanSubpath = sharedRemotePathUtils.normalizeRemoteScanSubpath;
+const getStorageRootFromPath = sharedRemotePathUtils.getStorageRootFromPath;
+const buildTempRootForArchive = sharedRemotePathUtils.buildTempRootForArchive;
+const getTitleFromParam = sharedGameMeta.getTitleFromParam;
+const parseGameMetaFromParam = sharedGameMeta.parseGameMetaFromParam;
+const payloadPathIsElf = sharedPayloadFileUtils.payloadPathIsElf;
+const createLocalPayloadElfFinder = sharedPayloadFileUtils.createLocalPayloadElfFinder;
+const probePayloadFile = sharedPayloadFileUtils.probePayloadFile;
 
 const ROOT_DIR = path.join(__dirname, '..');
 const VERSION_FILE = path.join(ROOT_DIR, 'VERSION');
@@ -30,10 +67,10 @@ const FALLBACK_PUBLIC_DIR = path.join(__dirname, 'public');
 const BRIDGE_FILE = path.join(__dirname, 'web-bridge.js');
 const TRANSFER_PORT = 9113;
 const PAYLOAD_PORT = 9021;
-const CONNECTION_TIMEOUT_MS = 30000;
-const READ_TIMEOUT_MS = 120000;
-const PAYLOAD_STATUS_CONNECT_TIMEOUT_MS = 5000;
-const PAYLOAD_STATUS_READ_TIMEOUT_MS = 10000;
+const CONNECTION_TIMEOUT_MS = sharedTransferConstants.CONNECTION_TIMEOUT_MS;
+const READ_TIMEOUT_MS = sharedTransferConstants.READ_TIMEOUT_MS;
+const PAYLOAD_STATUS_CONNECT_TIMEOUT_MS = sharedTransferConstants.PAYLOAD_STATUS_CONNECT_TIMEOUT_MS;
+const PAYLOAD_STATUS_READ_TIMEOUT_MS = sharedTransferConstants.PAYLOAD_STATUS_READ_TIMEOUT_MS;
 const UPLOAD_SOCKET_BUFFER_SIZE = 8 * 1024 * 1024;
 const UploadCmd = {
   StartUpload: 0x10,
@@ -47,16 +84,76 @@ const UploadResp = {
   Ready: 0x04,
   Progress: 0x05,
 };
-const LANE_CONNECTIONS = 4;
-const LANE_HUGE_FILE_BYTES = 20 * 1024 * 1024 * 1024;
-const LANE_LARGE_FILE_BYTES = 4 * 1024 * 1024 * 1024;
-const LANE_HUGE_CHUNK_BYTES = 1536 * 1024 * 1024;
-const LANE_LARGE_CHUNK_BYTES = 512 * 1024 * 1024;
-const LANE_DEFAULT_CHUNK_BYTES = 256 * 1024 * 1024;
-const LANE_MIN_FILE_SIZE = 512 * 1024 * 1024;
+const LANE_CONNECTIONS = sharedTransferConstants.LANE_CONNECTIONS;
+const LANE_HUGE_FILE_BYTES = sharedTransferConstants.LANE_HUGE_FILE_BYTES;
+const LANE_LARGE_FILE_BYTES = sharedTransferConstants.LANE_LARGE_FILE_BYTES;
+const LANE_HUGE_CHUNK_BYTES = sharedTransferConstants.LANE_HUGE_CHUNK_BYTES;
+const LANE_LARGE_CHUNK_BYTES = sharedTransferConstants.LANE_LARGE_CHUNK_BYTES;
+const LANE_DEFAULT_CHUNK_BYTES = sharedTransferConstants.LANE_DEFAULT_CHUNK_BYTES;
+const LANE_MIN_FILE_SIZE = sharedTransferConstants.LANE_MIN_FILE_SIZE;
+const MAD_MAX_WORKERS = sharedTransferConstants.MAD_MAX_WORKERS;
+const MAD_MAX_HUGE_CHUNK_BYTES = sharedTransferConstants.MAD_MAX_HUGE_CHUNK_BYTES;
+const MAD_MAX_LARGE_CHUNK_BYTES = sharedTransferConstants.MAD_MAX_LARGE_CHUNK_BYTES;
+const MAD_MAX_DEFAULT_CHUNK_BYTES = sharedTransferConstants.MAD_MAX_DEFAULT_CHUNK_BYTES;
+const MAD_MAX_MIN_FILE_SIZE = sharedTransferConstants.MAD_MAX_MIN_FILE_SIZE;
+const RESUME_HASH_LARGE_BYTES = 1024 * 1024 * 1024;
+const RESUME_HASH_MED_BYTES = 128 * 1024 * 1024;
+const RESUME_HASH_REMOTE_PARALLELISM = 2;
 const PRECREATE_MAX_DIRS = 5000;
 const PRECREATE_DIR_CONCURRENCY = 4;
 const VERSION_RE = /^v?(\d+)\.(\d+)\.(\d+)(?:[-+].*)?$/;
+
+const payloadRpc = sharedPayloadRpc.createPayloadRpc({
+  net,
+  connectionTimeoutMs: CONNECTION_TIMEOUT_MS,
+  readTimeoutMs: READ_TIMEOUT_MS,
+});
+const payloadQueueApi = sharedPayloadQueueApi.createPayloadQueueApi({
+  sendSimpleCommand: (ip, port, cmd) => payloadRpc.sendSimpleCommand(ip, port, cmd),
+  sendCommandExpectPayload: (ip, port, cmd) => payloadRpc.sendCommandExpectPayload(ip, port, cmd),
+  sendCommandWithPayload: (ip, port, header, payload) => payloadRpc.sendCommandWithPayload(ip, port, header, payload),
+});
+const payloadFsApi = sharedPayloadFsApi.createPayloadFsApi({
+  sendSimpleCommand: (ip, port, cmd, signal) => payloadRpc.sendSimpleCommand(ip, port, cmd, signal),
+  sendCommandReadAll: (ip, port, cmd, signal) => payloadRpc.sendCommandReadAll(ip, port, cmd, signal),
+});
+const clientRuntimeHelpers = sharedClientRuntimeHelpers.createClientRuntimeHelpers({
+  payloadRpc,
+  transferCore,
+  transferConstants: sharedTransferConstants,
+  hashWasm,
+  uploadSocketBufferSize: UPLOAD_SOCKET_BUFFER_SIZE,
+  connectionTimeoutMs: CONNECTION_TIMEOUT_MS,
+});
+const createSocketWithTimeout = clientRuntimeHelpers.createSocketWithTimeout;
+const tuneUploadSocket = clientRuntimeHelpers.tuneUploadSocket;
+const createSocketLineReader = clientRuntimeHelpers.createSocketLineReader;
+const createSocketReader = clientRuntimeHelpers.createSocketReader;
+const buildUploadStartPayload = clientRuntimeHelpers.buildUploadStartPayload;
+const isLocalHashAlgorithmSupported = clientRuntimeHelpers.isLocalHashAlgorithmSupported;
+const getLaneChunkSize = clientRuntimeHelpers.getLaneChunkSize;
+const getMadMaxChunkSize = clientRuntimeHelpers.getMadMaxChunkSize;
+const classifyPayloadUploadBottleneck = clientRuntimeHelpers.classifyPayloadUploadBottleneck;
+const findLocalPayloadElf = createLocalPayloadElfFinder({
+  pathModule: path,
+  baseDir: __dirname,
+  includeParentPayload: true,
+  payloadRelativePath: '../payload/ps5upload.elf',
+  includeCwdPayload: true,
+  includeCwdRoot: true,
+});
+const mapWithConcurrency = sharedAsyncUtils.mapWithConcurrency;
+const localFileScan = sharedLocalFileScan.createLocalFileScan({ fs, path });
+const walkLocalFiles = localFileScan.walkLocalFiles;
+const remoteFileMutex = sharedKeyedMutex.createKeyedMutex();
+const payloadRemoteHelpers = sharedPayloadRemoteHelpers.createPayloadRemoteHelpers({
+  createSocketWithTimeout,
+  sendSimpleCommand: (ip, port, cmd, signal) => payloadRpc.sendSimpleCommand(ip, port, cmd, signal),
+  commandForRemoteHashAlgorithm,
+  transferPort: TRANSFER_PORT,
+});
+const downloadRemoteFileToBuffer = payloadRemoteHelpers.downloadRemoteFileToBuffer;
+const hashFileRemote = payloadRemoteHelpers.hashFileRemote;
 
 function createTransferStatus(overrides = {}) {
   return {
@@ -70,6 +167,8 @@ function createTransferStatus(overrides = {}) {
     payload_speed_bps: 0,
     ftp_speed_bps: 0,
     total_speed_bps: 0,
+    payload_transfer_path: null,
+    payload_workers: null,
     ...overrides,
   };
 }
@@ -165,99 +264,30 @@ function ensureDir(dirPath) {
   fs.mkdirSync(dirPath, { recursive: true });
 }
 
-function readJson(filePath, fallback) {
-  try {
-    if (!fs.existsSync(filePath)) return fallback;
-    return JSON.parse(fs.readFileSync(filePath, 'utf8'));
-  } catch {
-    return fallback;
-  }
-}
-
-function writeJson(filePath, data) {
-  ensureDir(path.dirname(filePath));
-  fs.writeFileSync(filePath, JSON.stringify(data, null, 2), 'utf8');
-}
-
-function configPath() {
-  return path.join(getAppDataDir(), 'app-config.json');
-}
-
-function profilesPath() {
-  return path.join(getAppDataDir(), 'ps5upload_profiles.json');
-}
-
-function queuePath() {
-  return path.join(getAppDataDir(), 'ps5upload_queue.json');
-}
-
-function historyPath() {
-  return path.join(getAppDataDir(), 'ps5upload_history.json');
-}
-
-function loadConfig() {
-  const cfg = readJson(configPath(), null);
-  if (!cfg || typeof cfg !== 'object') return { ...defaultConfig };
-  return { ...defaultConfig, ...cfg };
-}
-
-function saveConfig(input) {
-  const merged = { ...defaultConfig, ...(input || {}) };
-  writeJson(configPath(), merged);
-}
-
-function loadProfiles() {
-  return readJson(profilesPath(), { profiles: [], default_profile: null });
-}
-
-function saveProfiles(input) {
-  const next = {
-    profiles: Array.isArray(input && input.profiles) ? input.profiles : [],
-    default_profile: input && typeof input.default_profile === 'string' ? input.default_profile : null,
-  };
-  writeJson(profilesPath(), next);
-}
-
-function loadQueue() {
-  return readJson(queuePath(), { items: [], next_id: 1, rev: 0, updated_at: Date.now() });
-}
-
-function saveQueue(input) {
-  const now = Date.now();
-  const next = {
-    items: Array.isArray(input && input.items) ? input.items : [],
-    next_id: Number.isFinite(Number(input && input.next_id)) ? Number(input.next_id) : 1,
-    rev: Number.isFinite(Number(input && input.rev)) ? Number(input.rev) : 0,
-    updated_at: now,
-  };
-  writeJson(queuePath(), next);
-}
-
-function loadHistory() {
-  return readJson(historyPath(), { records: [], rev: 0, updated_at: Date.now() });
-}
-
-function saveHistory(input) {
-  const now = Date.now();
-  const next = {
-    records: Array.isArray(input && input.records) ? input.records : [],
-    rev: Number.isFinite(Number(input && input.rev)) ? Number(input.rev) : 0,
-    updated_at: now,
-  };
-  writeJson(historyPath(), next);
-}
-
-function addHistoryRecord(record) {
-  const current = loadHistory();
-  current.records = [record, ...(current.records || [])].slice(0, 500);
-  current.rev = (current.rev || 0) + 1;
-  current.updated_at = Date.now();
-  saveHistory(current);
-}
-
-function clearHistory() {
-  saveHistory({ records: [], rev: 0, updated_at: Date.now() });
-}
+const clientPersistence = sharedClientPersistence.createClientPersistence({
+  fs,
+  path,
+  getAppDataDir,
+  defaultConfig,
+  configFilename: 'app-config.json',
+  profilesFilename: 'ps5upload_profiles.json',
+  queueFilename: 'ps5upload_queue.json',
+  historyFilename: 'ps5upload_history.json',
+  queueSaveMode: 'preserve',
+  historySaveMode: 'preserve',
+  historyInsertMode: 'prepend',
+  historyLimit: 500,
+});
+const loadConfig = clientPersistence.loadConfig;
+const saveConfig = clientPersistence.saveConfig;
+const loadProfiles = clientPersistence.loadProfiles;
+const saveProfiles = clientPersistence.saveProfiles;
+const loadQueue = clientPersistence.loadQueue;
+const saveQueue = clientPersistence.saveQueue;
+const loadHistory = clientPersistence.loadHistory;
+const saveHistory = clientPersistence.saveHistory;
+const addHistoryRecord = clientPersistence.addHistoryRecord;
+const clearHistory = clientPersistence.clearHistory;
 
 function listNetworkInterfaces() {
   const interfaces = os.networkInterfaces();
@@ -469,581 +499,36 @@ async function isPortOpen(ip, port) {
   });
 }
 
-function createSocketWithTimeout(ip, port, timeout = CONNECTION_TIMEOUT_MS) {
-  return new Promise((resolve, reject) => {
-    const socket = new net.Socket();
-    socket.setTimeout(timeout);
-    socket.on('timeout', () => {
-      socket.destroy();
-      reject(new Error('Connection timed out'));
-    });
-    socket.on('error', (err) => reject(err));
-    socket.connect(port, ip, () => {
-      socket.setTimeout(0);
-      resolve(socket);
-    });
-  });
-}
-
-function tuneUploadSocket(socket) {
-  if (!socket) return;
-  socket.setNoDelay(true);
-  socket.setKeepAlive(true, 1000);
-  socket.setTimeout(15 * 60 * 1000, () => {
-    try { socket.destroy(new Error('Upload socket timeout')); } catch {}
-  });
-  if (typeof socket.setSendBufferSize === 'function') {
-    socket.setSendBufferSize(UPLOAD_SOCKET_BUFFER_SIZE);
-  }
-  if (typeof socket.setRecvBufferSize === 'function') {
-    socket.setRecvBufferSize(UPLOAD_SOCKET_BUFFER_SIZE);
-  }
-}
-
-function createSocketLineReader(socket) {
-  let buffer = Buffer.alloc(0);
-  const pending = [];
-  let socketError = null;
-
-  const flush = () => {
-    while (pending.length > 0) {
-      const idx = buffer.indexOf(0x0a);
-      if (idx < 0) return;
-      const line = buffer.subarray(0, idx).toString('utf8').trim();
-      buffer = buffer.subarray(idx + 1);
-      const { resolve } = pending.shift();
-      resolve(line);
-    }
-  };
-
-  const onData = (data) => {
-    buffer = Buffer.concat([buffer, data]);
-    flush();
-  };
-  const onErr = (err) => {
-    socketError = err;
-    while (pending.length > 0) {
-      const { reject } = pending.shift();
-      reject(err);
-    }
-  };
-  const onClose = () => {
-    if (buffer.length > 0 && pending.length > 0) {
-      const line = buffer.toString('utf8').trim();
-      buffer = Buffer.alloc(0);
-      const { resolve } = pending.shift();
-      resolve(line);
-    }
-    while (pending.length > 0) {
-      const { reject } = pending.shift();
-      reject(new Error('Socket closed before response'));
-    }
-  };
-
-  socket.on('data', onData);
-  socket.on('error', onErr);
-  socket.on('close', onClose);
-
-  return {
-    readLine: (timeoutMs = READ_TIMEOUT_MS) => new Promise((resolve, reject) => {
-      if (socketError) return reject(socketError);
-      const idx = buffer.indexOf(0x0a);
-      if (idx >= 0) {
-        const line = buffer.subarray(0, idx).toString('utf8').trim();
-        buffer = buffer.subarray(idx + 1);
-        return resolve(line);
-      }
-      const timer = setTimeout(() => {
-        const i = pending.findIndex((p) => p.resolve === resolve);
-        if (i >= 0) pending.splice(i, 1);
-        reject(new Error('Read timed out'));
-      }, timeoutMs);
-      pending.push({
-        resolve: (line) => {
-          clearTimeout(timer);
-          resolve(line);
-        },
-        reject: (err) => {
-          clearTimeout(timer);
-          reject(err);
-        },
-      });
-    }),
-  };
-}
-
-function createSocketReader(socket) {
-  let buffer = Buffer.alloc(0);
-  let ended = false;
-  let error = null;
-  const waiters = new Set();
-
-  const notify = () => {
-    for (const waiter of Array.from(waiters)) waiter();
-  };
-
-  const onData = (chunk) => {
-    buffer = Buffer.concat([buffer, chunk]);
-    notify();
-  };
-  const onError = (err) => {
-    error = err;
-    notify();
-  };
-  const onClose = () => {
-    ended = true;
-    notify();
-  };
-
-  socket.on('data', onData);
-  socket.on('error', onError);
-  socket.on('close', onClose);
-  socket.on('end', onClose);
-
-  const awaitCondition = (predicate, timeoutMs) => new Promise((resolve, reject) => {
-    if (error) return reject(error);
-    if (predicate()) return resolve();
-    if (ended) return reject(new Error('Connection closed'));
-
-    const waiter = () => {
-      if (error) {
-        cleanup();
-        reject(error);
-        return;
-      }
-      if (predicate()) {
-        cleanup();
-        resolve();
-        return;
-      }
-      if (ended) {
-        cleanup();
-        reject(new Error('Connection closed'));
-      }
-    };
-
-    let timeout = null;
-    if (timeoutMs) {
-      timeout = setTimeout(() => {
-        cleanup();
-        reject(new Error('Read timeout'));
-      }, timeoutMs);
-    }
-
-    const cleanup = () => {
-      waiters.delete(waiter);
-      if (timeout) clearTimeout(timeout);
-    };
-
-    waiters.add(waiter);
-  });
-
-  return {
-    readExact: async (length, timeoutMs) => {
-      if (length === 0) return Buffer.alloc(0);
-      await awaitCondition(() => buffer.length >= length, timeoutMs);
-      const out = buffer.slice(0, length);
-      buffer = buffer.slice(length);
-      return out;
-    },
-    close: () => {
-      socket.removeListener('data', onData);
-      socket.removeListener('error', onError);
-      socket.removeListener('close', onClose);
-      socket.removeListener('end', onClose);
-      waiters.clear();
-    },
-  };
-}
-
-function buildUploadStartPayload(remotePath, totalSize, offset) {
-  const pathBuf = Buffer.from(String(remotePath || ''), 'utf8');
-  const payload = Buffer.alloc(pathBuf.length + 1 + 8 + 8);
-  pathBuf.copy(payload, 0);
-  payload.writeBigUInt64LE(BigInt(totalSize), pathBuf.length + 1);
-  payload.writeBigUInt64LE(BigInt(offset), pathBuf.length + 9);
-  return payload;
-}
-
 async function readBinaryResponse(reader, timeoutMs = READ_TIMEOUT_MS) {
-  const header = await reader.readExact(5, timeoutMs);
-  const code = header.readUInt8(0);
-  const len = header.readUInt32LE(1);
-  const data = len > 0 ? await reader.readExact(len, timeoutMs) : Buffer.alloc(0);
-  return { code, data };
+  return transferCore.readBinaryResponse(reader, timeoutMs);
 }
 
-async function writeBinaryCommand(socket, cmd, payload) {
-  const body = payload || Buffer.alloc(0);
-  const header = Buffer.alloc(5);
-  header[0] = cmd;
-  header.writeUInt32LE(body.length, 1);
-  await writeAll(socket, header);
-  if (body.length > 0) {
-    await writeAll(socket, body);
-  }
+async function writeBinaryCommand(socket, cmd, payload, timeoutMs) {
+  return transferCore.writeBinaryCommand(socket, cmd, payload, timeoutMs);
 }
 
-function writeAll(socket, buffer) {
-  return new Promise((resolve, reject) => {
-    const onError = (err) => {
-      socket.removeListener('drain', onDrain);
-      reject(err);
-    };
-    const onDrain = () => {
-      socket.removeListener('error', onError);
-      resolve();
-    };
-    if (!socket.write(buffer)) {
-      socket.once('drain', onDrain);
-      socket.once('error', onError);
-    } else {
-      socket.removeListener('error', onError);
-      resolve();
-    }
-  });
-}
-
-function escapeCommandPath(value) {
-  const text = String(value ?? '');
-  const escaped = text
-    .replace(/\\/g, '\\\\')
-    .replace(/"/g, '\\"')
-    .replace(/\n/g, '\\n')
-    .replace(/\r/g, '\\r')
-    .replace(/\t/g, '\\t');
-  return `"${escaped}"`;
-}
-
-function joinRemotePath(root, rel) {
-  const base = String(root || '').replace(/\\/g, '/').replace(/\/+$/, '');
-  const sub = String(rel || '').replace(/\\/g, '/').replace(/^\/+/, '');
-  if (!base) return '/' + sub;
-  if (!sub) return base;
-  return `${base}/${sub}`;
+function writeAll(socket, buffer, timeoutMs) {
+  return transferCore.writeAll(socket, buffer, timeoutMs);
 }
 
 async function sendSimpleCommand(ip, port, cmd) {
-  const MAX_RESPONSE_SIZE = 1024 * 1024;
-  const socket = await createSocketWithTimeout(ip, port);
-
-  return new Promise((resolve, reject) => {
-    let data = Buffer.alloc(0);
-    let resolved = false;
-
-    const cleanup = () => {
-      socket.removeAllListeners();
-      socket.destroy();
-    };
-
-    socket.setTimeout(READ_TIMEOUT_MS);
-    socket.on('timeout', () => {
-      if (resolved) return;
-      resolved = true;
-      cleanup();
-      reject(new Error('Read timed out'));
-    });
-
-    socket.on('data', (chunk) => {
-      if (resolved) return;
-      data = Buffer.concat([data, chunk]);
-      if (data.length > MAX_RESPONSE_SIZE) {
-        resolved = true;
-        cleanup();
-        reject(new Error('Response too large'));
-        return;
-      }
-      if (data.includes(Buffer.from('\n'))) {
-        resolved = true;
-        cleanup();
-        resolve(data.toString('utf8').trim());
-      }
-    });
-
-    socket.on('error', (err) => {
-      if (resolved) return;
-      resolved = true;
-      cleanup();
-      reject(err);
-    });
-
-    socket.on('close', () => {
-      if (resolved) return;
-      resolved = true;
-      if (data.length > 0) {
-        resolve(data.toString('utf8').trim());
-      } else {
-        reject(new Error('Connection closed'));
-      }
-    });
-
-    socket.write(cmd);
-  });
+  return payloadRpc.sendSimpleCommand(ip, port, cmd);
 }
 
 async function sendCommandWithPayload(ip, port, header, payload) {
-  const socket = await createSocketWithTimeout(ip, port);
-  return new Promise((resolve, reject) => {
-    let data = Buffer.alloc(0);
-    let resolved = false;
-
-    const cleanup = () => {
-      socket.removeAllListeners();
-      socket.destroy();
-    };
-
-    socket.setTimeout(READ_TIMEOUT_MS);
-    socket.on('timeout', () => {
-      if (resolved) return;
-      resolved = true;
-      cleanup();
-      reject(new Error('Read timed out'));
-    });
-
-    socket.on('data', (chunk) => {
-      if (resolved) return;
-      data = Buffer.concat([data, chunk]);
-      if (data.includes(Buffer.from('\n'))) {
-        resolved = true;
-        cleanup();
-        resolve(data.toString('utf8').trim());
-      }
-    });
-
-    socket.on('error', (err) => {
-      if (resolved) return;
-      resolved = true;
-      cleanup();
-      reject(err);
-    });
-
-    socket.write(header, () => {
-      socket.write(payload);
-    });
-  });
+  return payloadRpc.sendCommandWithPayload(ip, port, header, payload);
 }
 
 async function sendCommandExpectPayload(ip, port, cmd) {
-  const socket = await createSocketWithTimeout(ip, port);
-  return new Promise((resolve, reject) => {
-    let header = '';
-    let body = Buffer.alloc(0);
-    let expected = null;
-
-    const cleanup = () => {
-      socket.removeAllListeners();
-      socket.destroy();
-    };
-
-    socket.setTimeout(READ_TIMEOUT_MS);
-    socket.on('timeout', () => {
-      cleanup();
-      reject(new Error('Read timed out'));
-    });
-
-    socket.on('data', (chunk) => {
-      if (expected === null) {
-        header += chunk.toString('utf8');
-        const idx = header.indexOf('\n');
-        if (idx === -1) return;
-        const line = header.slice(0, idx).trim();
-        const rest = header.slice(idx + 1);
-        const parts = line.split(' ');
-        if (parts[0] !== 'OK') {
-          cleanup();
-          reject(new Error(line || 'Invalid response'));
-          return;
-        }
-        expected = Number.parseInt(parts[1] || '0', 10) || 0;
-        body = Buffer.from(rest, 'utf8');
-        if (body.length >= expected) {
-          cleanup();
-          resolve(body.slice(0, expected).toString('utf8'));
-        }
-        return;
-      }
-      body = Buffer.concat([body, chunk]);
-      if (body.length >= expected) {
-        cleanup();
-        resolve(body.slice(0, expected).toString('utf8'));
-      }
-    });
-
-    socket.on('error', (err) => {
-      cleanup();
-      reject(err);
-    });
-
-    socket.write(cmd);
-  });
+  return payloadRpc.sendCommandExpectPayload(ip, port, cmd);
 }
 
 async function listStorage(ip, port) {
-  const MAX_RESPONSE_SIZE = 10 * 1024 * 1024;
-  const socket = await createSocketWithTimeout(ip, port);
-
-  return new Promise((resolve, reject) => {
-    let data = Buffer.alloc(0);
-    let resolved = false;
-
-    const cleanup = () => {
-      socket.removeAllListeners();
-      socket.destroy();
-    };
-
-    socket.setTimeout(READ_TIMEOUT_MS);
-    socket.on('timeout', () => {
-      if (resolved) return;
-      resolved = true;
-      cleanup();
-      reject(new Error('Read timed out'));
-    });
-
-    socket.on('data', (chunk) => {
-      if (resolved) return;
-      data = Buffer.concat([data, chunk]);
-      if (data.length > MAX_RESPONSE_SIZE) {
-        resolved = true;
-        cleanup();
-        reject(new Error('Response too large'));
-        return;
-      }
-      const str = data.toString('utf8');
-      if (str.startsWith('ERROR:')) {
-        resolved = true;
-        cleanup();
-        reject(new Error(str.trim()));
-        return;
-      }
-      if (str.includes('\n]\n') || str.endsWith('\n]')) {
-        resolved = true;
-        cleanup();
-        try {
-          const jsonEnd = str.lastIndexOf(']');
-          const jsonStr = str.substring(0, jsonEnd + 1);
-          resolve(JSON.parse(jsonStr));
-        } catch {
-          reject(new Error('Invalid JSON response'));
-        }
-      }
-    });
-
-    socket.on('error', (err) => {
-      if (resolved) return;
-      resolved = true;
-      cleanup();
-      reject(err);
-    });
-
-    socket.write('LIST_STORAGE\n');
-  });
+  return payloadFsApi.listStorage(ip, port);
 }
 
 async function listDir(ip, port, dirPath) {
-  const MAX_RESPONSE_SIZE = 10 * 1024 * 1024;
-  const socket = await createSocketWithTimeout(ip, port);
-
-  return new Promise((resolve, reject) => {
-    let data = Buffer.alloc(0);
-    let resolved = false;
-
-    const cleanup = () => {
-      socket.removeAllListeners();
-      socket.destroy();
-    };
-
-    socket.setTimeout(READ_TIMEOUT_MS);
-    socket.on('timeout', () => {
-      if (resolved) return;
-      resolved = true;
-      cleanup();
-      reject(new Error('Read timed out'));
-    });
-
-    socket.on('data', (chunk) => {
-      if (resolved) return;
-      data = Buffer.concat([data, chunk]);
-      if (data.length > MAX_RESPONSE_SIZE) {
-        resolved = true;
-        cleanup();
-        reject(new Error('Response too large'));
-        return;
-      }
-      const str = data.toString('utf8');
-      if (str.startsWith('ERROR:')) {
-        resolved = true;
-        cleanup();
-        reject(new Error(str.trim()));
-        return;
-      }
-      if (str.includes('\n]\n') || str.endsWith('\n]')) {
-        resolved = true;
-        cleanup();
-        try {
-          const jsonEnd = str.lastIndexOf(']');
-          const jsonStr = str.substring(0, jsonEnd + 1);
-          resolve(JSON.parse(jsonStr));
-        } catch {
-          reject(new Error('Invalid JSON response'));
-        }
-      }
-    });
-
-    socket.on('error', (err) => {
-      if (resolved) return;
-      resolved = true;
-      cleanup();
-      reject(err);
-    });
-
-    socket.write(`LIST_DIR ${dirPath}\n`);
-  });
-}
-
-function isRemoteDirEntry(entry) {
-  if (!entry || typeof entry !== 'object') return false;
-  const entryType = String(entry.entry_type || entry.type || '').toLowerCase();
-  return Boolean(entry.is_dir) || entryType === 'd' || entryType === 'dir' || entryType === 'directory';
-}
-
-function joinRemoteScanPath() {
-  return Array.from(arguments)
-    .filter((part) => typeof part === 'string' && part.trim().length > 0)
-    .map((part, index) => {
-      const value = String(part);
-      if (index === 0) return value.replace(/\/+$/, '') || '/';
-      return value.replace(/^\/+/, '').replace(/\/+$/, '');
-    })
-    .join('/');
-}
-
-function normalizeRemoteScanSubpath(value) {
-  if (typeof value !== 'string') return null;
-  const normalized = value.trim().replace(/\\/g, '/').replace(/^\/+/, '').replace(/\/+$/, '');
-  return normalized || null;
-}
-
-function getTitleFromParam(param) {
-  if (param && typeof param.titleName === 'string') return param.titleName;
-  const localized = param && param.localizedParameters;
-  if (!localized || typeof localized !== 'object') return null;
-  let region = typeof localized.defaultLanguage === 'string' ? localized.defaultLanguage.trim() : '';
-  if (!region) region = 'en-US';
-  const normalized = region.replace('_', '-');
-  const direct = localized[normalized] && localized[normalized].titleName;
-  if (typeof direct === 'string') return direct;
-  const fallback = localized['en-US'] && localized['en-US'].titleName;
-  return typeof fallback === 'string' ? fallback : null;
-}
-
-function parseGameMetaFromParam(param) {
-  if (!param || typeof param !== 'object') return null;
-  return {
-    title: getTitleFromParam(param) || 'Unknown',
-    title_id: typeof param.titleId === 'string' ? param.titleId : '',
-    content_id: typeof param.contentId === 'string' ? param.contentId : '',
-    version: typeof param.contentVersion === 'string' ? param.contentVersion : '',
-  };
+  return payloadFsApi.listDir(ip, port, dirPath);
 }
 
 function guessImageMime(filePath) {
@@ -1059,88 +544,13 @@ function bufferToDataUrl(buffer, filePath) {
   return `data:${mime};base64,${buffer.toString('base64')}`;
 }
 
-async function downloadRemoteFileToBuffer(ip, remotePath, maxBytes) {
-  const limit = typeof maxBytes === 'number' ? maxBytes : 8 * 1024 * 1024;
-  const socket = await createSocketWithTimeout(ip, TRANSFER_PORT);
-  socket.setTimeout(0);
-  return new Promise((resolve, reject) => {
-    let headerDone = false;
-    let expectedSize = 0;
-    let headerBuf = Buffer.alloc(0);
-    const chunks = [];
-    let received = 0;
-    let settled = false;
-    const finish = (err, value) => {
-      if (settled) return;
-      settled = true;
-      socket.removeAllListeners();
-      socket.destroy();
-      if (err) reject(err);
-      else resolve(value);
-    };
-    socket.on('data', (chunk) => {
-      if (!headerDone) {
-        headerBuf = Buffer.concat([headerBuf, chunk]);
-        const nl = headerBuf.indexOf('\n');
-        if (nl === -1) return;
-        const line = headerBuf.slice(0, nl).toString('utf8').trim();
-        const remainder = headerBuf.slice(nl + 1);
-        headerBuf = Buffer.alloc(0);
-        if (line.startsWith('ERROR')) return finish(new Error(line));
-        const match = line.match(/^(?:OK|READY)\s+(\d+)/i);
-        if (!match) return finish(new Error(`Unexpected response: ${line}`));
-        expectedSize = Number.parseInt(match[1], 10) || 0;
-        if (expectedSize > limit) return finish(new Error(`File too large for scan: ${remotePath}`));
-        headerDone = true;
-        if (remainder.length) {
-          chunks.push(remainder);
-          received += remainder.length;
-        }
-      } else {
-        chunks.push(chunk);
-        received += chunk.length;
-      }
-      if (received > limit) return finish(new Error(`File exceeded scan limit: ${remotePath}`));
-      if (headerDone && received >= expectedSize) {
-        return finish(null, Buffer.concat(chunks, received).subarray(0, expectedSize));
-      }
-      return null;
-    });
-    socket.on('error', (err) => finish(err));
-    socket.on('close', () => {
-      if (!headerDone) return finish(new Error(`Connection closed before response for ${remotePath}`));
-      if (received >= expectedSize) return finish(null, Buffer.concat(chunks, received).subarray(0, expectedSize));
-      return finish(new Error(`Incomplete download for ${remotePath}: ${received}/${expectedSize}`));
-    });
-    socket.write(`DOWNLOAD ${remotePath}\n`);
-  });
-}
-
 async function listDirRecursiveCompat(ip, dirPath) {
-  const files = [];
-  const stack = [{ path: dirPath, rel: '' }];
-  while (stack.length > 0) {
-    const current = stack.pop();
-    if (!current) continue;
-    let entries = [];
-    try {
-      entries = await listDir(ip, TRANSFER_PORT, current.path);
-    } catch {
-      continue;
-    }
-    for (const entry of entries) {
-      const name = String(entry && entry.name ? entry.name : '');
-      if (!name) continue;
-      const relPath = current.rel ? `${current.rel}/${name}` : name;
-      const remotePath = `${current.path}/${name}`;
-      if (isRemoteDirEntry(entry)) {
-        stack.push({ path: remotePath, rel: relPath });
-      } else {
-        files.push({ remotePath, relPath, size: Number(entry.size) || 0 });
-      }
-    }
-  }
-  return files;
+  return sharedResumeScan.listDirRecursiveCompat({
+    listDir,
+    ip,
+    port: TRANSFER_PORT,
+    dirPath,
+  });
 }
 
 async function runProgressCommand(ip, command, onProgressLine) {
@@ -1284,40 +694,46 @@ async function collectLocalFiles(basePath, options = {}) {
   return { files: entries, total };
 }
 
-async function walkLocalFiles(basePath, options = {}) {
-  const onFile = typeof options.onFile === 'function' ? options.onFile : null;
-  const shouldCancel = typeof options.shouldCancel === 'function' ? options.shouldCancel : null;
-  const stat = await fs.promises.stat(basePath);
-  if (stat.isFile()) {
-    const item = { abs_path: basePath, rel_path: path.basename(basePath), size: stat.size };
-    if (onFile) await onFile(item);
-    return;
+async function createHashWasmHasher(algorithm) {
+  if (!hashWasm) {
+    throw new Error('hash-wasm not available');
   }
-  const stack = [{ abs: basePath, rel: '' }];
-  while (stack.length > 0) {
-    if (shouldCancel && shouldCancel()) throw new Error('Transfer cancelled');
-    const current = stack.pop();
-    if (!current) continue;
-    const dirEntries = await fs.promises.readdir(current.abs, { withFileTypes: true });
-    for (const entry of dirEntries) {
-      if (shouldCancel && shouldCancel()) throw new Error('Transfer cancelled');
-      const abs = path.join(current.abs, entry.name);
-      const rel = current.rel ? `${current.rel}/${entry.name}` : entry.name;
-      if (entry.isDirectory()) {
-        stack.push({ abs, rel });
-      } else if (entry.isFile()) {
-        const st = await fs.promises.stat(abs);
-        const item = { abs_path: abs, rel_path: rel, size: st.size };
-        if (onFile) await onFile(item);
-      }
+  if (algorithm === 'blake3') {
+    if (typeof hashWasm.createBLAKE3 !== 'function') {
+      throw new Error('BLAKE3 not available');
     }
+    return hashWasm.createBLAKE3();
   }
+  if (algorithm === 'xxh64') {
+    if (typeof hashWasm.createXXHash64 !== 'function') {
+      throw new Error('XXH64 not available');
+    }
+    return hashWasm.createXXHash64();
+  }
+  throw new Error(`Unsupported hash algorithm: ${algorithm}`);
 }
 
-function getLaneChunkSize(totalSize) {
-  if (totalSize >= LANE_HUGE_FILE_BYTES) return LANE_HUGE_CHUNK_BYTES;
-  if (totalSize >= LANE_LARGE_FILE_BYTES) return LANE_LARGE_CHUNK_BYTES;
-  return LANE_DEFAULT_CHUNK_BYTES;
+async function hashFileLocal(filePath, algorithm = 'sha256') {
+  const algo = String(algorithm || 'sha256').toLowerCase();
+  if (algo === 'sha256') {
+    return new Promise((resolve, reject) => {
+      const hash = crypto.createHash('sha256');
+      const stream = fs.createReadStream(filePath);
+      stream.on('data', (chunk) => hash.update(chunk));
+      stream.on('error', reject);
+      stream.on('end', () => resolve(hash.digest('hex')));
+    });
+  }
+  const hasher = await createHashWasmHasher(algo);
+  if (typeof hasher.init === 'function') {
+    hasher.init();
+  }
+  return new Promise((resolve, reject) => {
+    const stream = fs.createReadStream(filePath);
+    stream.on('data', (chunk) => hasher.update(chunk));
+    stream.on('error', reject);
+    stream.on('end', () => resolve(String(hasher.digest('hex')).toLowerCase()));
+  });
 }
 
 async function precreateRemoteDirectories(ip, destRoot, files, options = {}) {
@@ -1377,232 +793,71 @@ async function precreateRemoteDirectories(ip, destRoot, files, options = {}) {
   return { total, created, skipped: failed };
 }
 
+const payloadUploadCore = sharedPayloadUploadCore.createPayloadUploadCore({
+  createSocketWithTimeout,
+  tuneUploadSocket,
+  readBinaryResponse,
+  writeBinaryCommand,
+  writeAll,
+  buildUploadStartPayload,
+  joinRemotePath,
+  getLaneChunkSize,
+  transferPort: TRANSFER_PORT,
+  readTimeoutMs: READ_TIMEOUT_MS,
+  laneMinFileSize: LANE_MIN_FILE_SIZE,
+  laneConnections: LANE_CONNECTIONS,
+  uploadCmd: UploadCmd,
+  uploadResp: UploadResp,
+  fs,
+  writeTimeoutMs: 300000,
+});
+
 async function uploadFastOneFile(ip, destRoot, file, options = {}) {
-  const shouldCancel = typeof options.shouldCancel === 'function' ? options.shouldCancel : null;
-  const onProgress = typeof options.onProgress === 'function' ? options.onProgress : null;
-  const chmodAfterUpload = Boolean(options.chmodAfterUpload);
-  const socket = await createSocketWithTimeout(ip, TRANSFER_PORT);
-  tuneUploadSocket(socket);
-  const reader = createSocketReader(socket);
-  try {
-    const remotePath = joinRemotePath(destRoot, file.rel_path);
-    const startPayload = buildUploadStartPayload(remotePath, file.size, 0);
-    await writeBinaryCommand(socket, UploadCmd.StartUpload, startPayload);
-    const readyResp = await readBinaryResponse(reader, READ_TIMEOUT_MS);
-    if (readyResp.code !== UploadResp.Ready) {
-      const msg = readyResp.data?.length ? readyResp.data.toString('utf8') : 'no response';
-      throw new Error(`Upload rejected: ${msg}`);
-    }
-           if (Number(file.size) > 0) {
-             const fd = await fs.promises.open(file.abs_path, 'r');
-             try {
-               const buf = Buffer.allocUnsafe(5 + 8 * 1024 * 1024);
-               let remaining = Number(file.size);
-               let pos = 0;
-               while (remaining > 0) {
-                 if (shouldCancel && shouldCancel()) throw new Error('Transfer cancelled');
-                 const take = Math.min(buf.length - 5, remaining);
-                 const { bytesRead } = await fd.read(buf, 5, take, pos);
-                 if (bytesRead <= 0) throw new Error('Read failed');
-          buf[0] = UploadCmd.UploadChunk;
-                 buf.writeUInt32LE(bytesRead, 1);
-                 await writeAll(socket, buf.subarray(0, 5 + bytesRead));
-                 remaining -= bytesRead;
-                 pos += bytesRead;
-                 if (onProgress) onProgress(bytesRead);
-               }
-             } finally {
-               await fd.close().catch(() => {});
-             }
-           }
-    await writeBinaryCommand(socket, UploadCmd.EndUpload, Buffer.alloc(0));
-    const endResp = await readBinaryResponse(reader, READ_TIMEOUT_MS);
-    if (endResp.code !== UploadResp.Ok) {
-      const msg = endResp.data?.length ? endResp.data.toString('utf8') : 'unknown response';
-      throw new Error(`Upload failed: ${msg}`);
-    }
-    if (chmodAfterUpload) {
-      try {
-        await chmod777(ip, TRANSFER_PORT, remotePath);
-      } catch {
-        // non-fatal
-      }
-    }
-    return true;
-  } finally {
-    try { reader.close(); } catch {}
-    try { socket.destroy(); } catch {}
-  }
+  return payloadUploadCore.uploadFastOneFile(ip, destRoot, file, {
+    ...options,
+    createSocketReader,
+    chmodAfterUploadFn: async (remotePath) => chmod777(ip, TRANSFER_PORT, remotePath),
+  });
 }
 
 async function uploadFastMultiFile(ip, destRoot, files, options = {}) {
-  const connections = Math.max(1, Math.min(8, Number(options.connections) || 8));
-  const shouldCancel = typeof options.shouldCancel === 'function' ? options.shouldCancel : null;
-  const onProgress = typeof options.onProgress === 'function' ? options.onProgress : null;
-  const onFileStart = typeof options.onFileStart === 'function' ? options.onFileStart : null;
-  const onFileDone = typeof options.onFileDone === 'function' ? options.onFileDone : null;
-  const chmodAfterUpload = Boolean(options.chmodAfterUpload);
-
-  const queue = Array.isArray(files) ? [...files] : [];
-  let totalSent = 0;
-
-  let laneLocked = false;
-  let laneWaiters = [];
-  const acquireLaneLock = async () => {
-    while (laneLocked) {
-      await new Promise((resolve) => laneWaiters.push(resolve));
-    }
-    laneLocked = true;
-  };
-  const releaseLaneLock = () => {
-    laneLocked = false;
-    const waiters = laneWaiters;
-    laneWaiters = [];
-    for (const resolve of waiters) resolve();
-  };
-  const waitIfLaneBusy = async () => {
-    while (laneLocked) {
-      await new Promise((resolve) => laneWaiters.push(resolve));
-    }
-  };
-
-  const runWorker = async () => {
-    while (queue.length > 0) {
-      if (shouldCancel && shouldCancel()) throw new Error('Transfer cancelled');
-      await waitIfLaneBusy();
-      const file = queue.shift();
-      if (!file) continue;
-      if (onFileStart) onFileStart(file);
-      if (Number(file.size || 0) >= LANE_MIN_FILE_SIZE) {
-        await acquireLaneLock();
-        try {
-          const laneBaseBytes = totalSent;
-          await uploadLaneSingleFile(ip, destRoot, file, {
-            connections,
-            shouldCancel,
-            chmodAfterUpload,
-            onProgress: (sent) => {
-              totalSent = laneBaseBytes + sent;
-              if (onProgress) onProgress(totalSent, file);
-            },
-          });
-        } finally {
-          releaseLaneLock();
-        }
-      } else {
-        await uploadFastOneFile(ip, destRoot, file, {
-          shouldCancel,
-          chmodAfterUpload,
-          onProgress: (delta) => {
-            totalSent += delta;
-            if (onProgress) onProgress(totalSent, file);
-          },
-        });
-      }
-      if (onFileDone) onFileDone(file);
-    }
-  };
-  const workers = Array.from({ length: Math.min(connections, queue.length || 1) }, () => runWorker());
-  await Promise.all(workers);
-  return { bytes: totalSent, files: Array.isArray(files) ? files.length : 0 };
+  return payloadUploadCore.uploadFastMultiFile(ip, destRoot, files, {
+    ...options,
+    createSocketReader,
+    acquireRemoteLock: async (remotePath) => remoteFileMutex.acquire(remotePath),
+    noProgressTimeoutMs: 45000,
+    retryAttempts: 1,
+    retryDelayMs: 300,
+    chmodAfterUploadFn: async (remotePath) => chmod777(ip, TRANSFER_PORT, remotePath),
+  });
 }
 
 async function uploadLaneSingleFile(ip, destRoot, file, options = {}) {
-  const shouldCancel = typeof options.shouldCancel === 'function' ? options.shouldCancel : null;
-  const onProgress = typeof options.onProgress === 'function' ? options.onProgress : null;
-  const chmodAfterUpload = Boolean(options.chmodAfterUpload);
-  const connections = Math.max(1, Math.min(8, Number(options.connections) || LANE_CONNECTIONS));
-  const totalSize = Number(file.size || 0);
-  if (totalSize <= 0) return;
-  const chunkSize = getLaneChunkSize(totalSize);
-  const chunks = [];
-  for (let offset = 0; offset < totalSize; offset += chunkSize) {
-    const len = Math.min(chunkSize, totalSize - offset);
-    chunks.push({ offset, len });
-  }
-  const workerQueues = Array.from({ length: connections }, () => []);
-  for (let i = 0; i < chunks.length; i++) {
-    workerQueues[i % connections].push(chunks[i]);
-  }
-  const activeQueues = workerQueues.filter((q) => q.length > 0);
-  const workerProgress = new Array(activeQueues.length).fill(0);
-  let lastProgressAt = 0;
-
-  let preallocResolved = false;
-  let preallocResolve = null;
-  let preallocReject = null;
-  const preallocPromise = new Promise((resolve, reject) => { preallocResolve = resolve; preallocReject = reject; });
-
-  const waitForPrealloc = async () => {
-    if (preallocResolved) return;
-    await preallocPromise;
-  };
-
-  const runWorker = async (queue, idx) => {
-    const socket = await createSocketWithTimeout(ip, TRANSFER_PORT);
-    tuneUploadSocket(socket);
-    const reader = createSocketReader(socket);
-    const fd = await fs.promises.open(file.abs_path, 'r');
+  let attempt = 0;
+  const maxAttempts = 2;
+  while (true) {
     try {
-      for (const chunk of queue) {
-        if (shouldCancel && shouldCancel()) throw new Error('Transfer cancelled');
-        if (chunk.offset !== 0) await waitForPrealloc();
-
-        const remotePath = joinRemotePath(destRoot, file.rel_path);
-        const startPayload = buildUploadStartPayload(remotePath, totalSize, chunk.offset);
-        await writeBinaryCommand(socket, UploadCmd.StartUpload, startPayload);
-        const readyResp = await readBinaryResponse(reader, READ_TIMEOUT_MS);
-        if (readyResp.code !== UploadResp.Ready) {
-          const msg = readyResp.data?.length ? readyResp.data.toString('utf8') : 'no response';
-          throw new Error(`Connection rejected: ${msg}`);
-        }
-        if (chunk.offset === 0 && !preallocResolved) {
-          preallocResolved = true;
-          preallocResolve();
-        }
-
-        let remaining = chunk.len;
-        let pos = chunk.offset;
-        const buf = Buffer.allocUnsafe(5 + 8 * 1024 * 1024);
-        while (remaining > 0) {
-          if (shouldCancel && shouldCancel()) throw new Error('Transfer cancelled');
-          const take = Math.min(buf.length - 5, remaining);
-          const { bytesRead } = await fd.read(buf, 5, take, pos);
-          if (bytesRead <= 0) throw new Error('Read failed');
-          buf[0] = UploadCmd.UploadChunk;
-          buf.writeUInt32LE(bytesRead, 1);
-          await writeAll(socket, buf.subarray(0, 5 + bytesRead));
-          remaining -= bytesRead;
-          pos += bytesRead;
-          workerProgress[idx] += bytesRead;
-          if (onProgress) {
-            const now = Date.now();
-            if (now - lastProgressAt >= 250 || remaining === 0) {
-              lastProgressAt = now;
-              const sent = workerProgress.reduce((sum, v) => sum + v, 0);
-              onProgress(sent);
-            }
-          }
-        }
-
-        await writeBinaryCommand(socket, UploadCmd.EndUpload, Buffer.alloc(0));
-        const endResp = await readBinaryResponse(reader, READ_TIMEOUT_MS);
-        if (endResp.code !== UploadResp.Ok) {
-          const msg = endResp.data?.length ? endResp.data.toString('utf8') : 'unknown response';
-          throw new Error(`Connection failed: ${msg}`);
-        }
-      }
+      return await payloadUploadCore.uploadLaneSingleFile(ip, destRoot, file, {
+        ...options,
+        createSocketReader,
+        noProgressTimeoutMs: 45000,
+        chmodAfterUploadFn: async (remotePath) => chmod777(ip, TRANSFER_PORT, remotePath),
+      });
     } catch (err) {
-      if (!preallocResolved) { preallocResolved = true; preallocReject(err); }
-      throw err;
-    } finally {
-      await fd.close().catch(() => {});
-      try { reader.close(); } catch {}
-      try { socket.destroy(); } catch {}
+      attempt += 1;
+      const message = String((err && err.message) || err || '').toLowerCase();
+      const retryable =
+        message.includes('timeout') ||
+        message.includes('timed out') ||
+        message.includes('stalled') ||
+        message.includes('econnreset') ||
+        message.includes('epipe');
+      if (!retryable || attempt >= maxAttempts) {
+        throw err;
+      }
+      await sleepMs(250 * attempt);
     }
-  };
-
-  await Promise.all(activeQueues.map((queue, idx) => runWorker(queue, idx)));
+  }
 }
 
 async function uploadFilesViaFtpSimple(ip, ftpPort, destRoot, files, options = {}) {
@@ -1615,6 +870,13 @@ async function uploadFilesViaFtpSimple(ip, ftpPort, destRoot, files, options = {
   let sent = 0;
   let filesUploaded = 0;
   const takeNextFile = () => queue.shift() || null;
+  const ensureFtpBinaryMode = async (client) => {
+    const res = await client.send('TYPE I');
+    if (!res || Number(res.code) >= 400) {
+      const code = res && Number.isFinite(Number(res.code)) ? Number(res.code) : -1;
+      throw new Error(`Failed to enable FTP binary mode (TYPE I, code=${code})`);
+    }
+  };
   const runWorker = async () => {
     const client = new ftp.Client(30000);
     client.ftp.verbose = false;
@@ -1635,11 +897,12 @@ async function uploadFilesViaFtpSimple(ip, ftpPort, destRoot, files, options = {
         client.close();
       } catch {}
       await client.connect(ip, ftpPort);
-      const res = await client.send('USER', 'anonymous');
+      const res = await client.send('USER anonymous');
       if (res && Number(res.code) === 331) {
-        await client.send('PASS', 'anonymous');
+        await client.send('PASS anonymous');
       }
     }
+    await ensureFtpBinaryMode(client);
 
     try {
       while (true) {
@@ -1791,33 +1054,23 @@ async function uploadLocalPathsViaFtpSimple(ip, ftpPort, destRoot, paths, option
 }
 
 async function deletePath(ip, port, filePath) {
-  const response = await sendSimpleCommand(ip, port, `DELETE_ASYNC ${filePath}\n`);
-  if (!response.startsWith('OK')) throw new Error(`Delete failed: ${response}`);
-  return true;
+  return payloadFsApi.deletePath(ip, port, filePath);
 }
 
 async function movePath(ip, port, src, dst) {
-  const response = await sendSimpleCommand(ip, port, `MOVE ${src}\t${dst}\n`);
-  if (!response.startsWith('OK')) throw new Error(`Move failed: ${response}`);
-  return true;
+  return payloadFsApi.movePath(ip, port, src, dst);
 }
 
 async function createPath(ip, port, dirPath) {
-  const response = await sendSimpleCommand(ip, port, `CREATE_PATH ${dirPath}\n`);
-  if (!response.startsWith('SUCCESS')) throw new Error(`Create folder failed: ${response}`);
-  return true;
+  return payloadFsApi.createPath(ip, port, dirPath);
 }
 
 async function chmod777(ip, port, filePath) {
-  const response = await sendSimpleCommand(ip, port, `CHMOD777 ${filePath}\n`);
-  if (!response.startsWith('OK')) throw new Error(`Chmod failed: ${response}`);
-  return true;
+  return payloadFsApi.chmod777(ip, port, filePath);
 }
 
 async function getPayloadVersion(ip, port) {
-  const response = await sendSimpleCommand(ip, port, 'VERSION\n');
-  if (response.startsWith('VERSION ')) return response.substring(8).trim();
-  throw new Error(`Unexpected response: ${response}`);
+  return payloadFsApi.getPayloadVersion(ip, port);
 }
 
 async function getPayloadStatus(ip, port) {
@@ -1872,84 +1125,6 @@ async function getPayloadStatus(ip, port) {
   });
 }
 
-function createDefaultPayloadCaps(version = null) {
-  return {
-    schema_version: 1,
-    source: 'compat',
-    payload_version: version || null,
-    firmware: null,
-    features: {
-      status: true,
-      queue: true,
-      queue_extract: true,
-      upload_queue_sync: true,
-      history_sync: true,
-      maintenance: true,
-      chmod: true,
-      games_scan_meta: true,
-    },
-    limits: {},
-    commands: [
-      'VERSION',
-      'PAYLOAD_STATUS',
-      'QUEUE_EXTRACT',
-      'QUEUE_CANCEL',
-      'QUEUE_CLEAR',
-      'QUEUE_CLEAR_ALL',
-      'QUEUE_CLEAR_FAILED',
-      'QUEUE_REORDER',
-      'QUEUE_PROCESS',
-      'QUEUE_PAUSE',
-      'QUEUE_RETRY',
-      'QUEUE_REMOVE',
-      'UPLOAD_QUEUE_GET',
-      'UPLOAD_QUEUE_SYNC',
-      'HISTORY_GET',
-      'HISTORY_SYNC',
-      'MAINTENANCE',
-      'CHMOD777',
-    ],
-    notes: [],
-    updated_at_ms: Date.now(),
-  };
-}
-
-function normalizePayloadCaps(raw, fallbackVersion = null) {
-  const base = createDefaultPayloadCaps(fallbackVersion);
-  if (!raw || typeof raw !== 'object') return base;
-  const next = {
-    ...base,
-    ...raw,
-    schema_version: Number.parseInt(String(raw.schema_version || base.schema_version), 10) || 1,
-    source: typeof raw.source === 'string' && raw.source.trim() ? raw.source : 'payload',
-    payload_version: raw.payload_version != null ? String(raw.payload_version) : base.payload_version,
-    firmware: raw.firmware != null ? String(raw.firmware) : null,
-    updated_at_ms: Date.now(),
-  };
-  if (raw.features && typeof raw.features === 'object') {
-    next.features = { ...base.features, ...raw.features };
-  }
-  if (!next.features || typeof next.features !== 'object') {
-    next.features = { ...base.features };
-  }
-  if (raw.limits && typeof raw.limits === 'object') {
-    next.limits = { ...raw.limits };
-  } else {
-    next.limits = {};
-  }
-  if (Array.isArray(raw.commands)) {
-    next.commands = raw.commands.map((item) => String(item));
-  } else {
-    next.commands = [...base.commands];
-  }
-  if (Array.isArray(raw.notes)) {
-    next.notes = raw.notes.map((item) => String(item));
-  } else {
-    next.notes = [];
-  }
-  return next;
-}
-
 async function getPayloadCaps(ip, port) {
   let version = null;
   let versionErr = null;
@@ -1983,174 +1158,80 @@ function isSafeRemotePath(p) {
   return false;
 }
 
-function getStorageRootFromPath(destPath) {
-  const normalized = String(destPath || '').replace(/\\/g, '/').trim();
-  if (!normalized.startsWith('/')) return null;
-  if (normalized === '/data' || normalized.startsWith('/data/')) return '/data';
-  if (normalized.startsWith('/mnt/')) {
-    const parts = normalized.split('/').filter(Boolean);
-    if (parts.length >= 2) return `/${parts[0]}/${parts[1]}`;
-  }
-  return null;
-}
-
-function buildTempRootForArchive(destPath, tempRootOverride) {
-  const override = typeof tempRootOverride === 'string' ? tempRootOverride.trim() : '';
-  if (override) {
-    if (override.endsWith('/ps5upload/tmp')) return override;
-    return `${override.replace(/\/+$/, '')}/ps5upload/tmp`;
-  }
-  const root = getStorageRootFromPath(destPath) || '/data';
-  return `${root}/ps5upload/tmp`;
-}
-
 async function payloadReset(ip, port) {
-  const response = await sendSimpleCommand(ip, port, 'RESET\n');
-  if (!response.startsWith('OK')) throw new Error(`Payload reset failed: ${response}`);
+  await payloadFsApi.payloadReset(ip, port);
   return true;
 }
 
 async function payloadClearTmp(ip, port) {
-  const response = await sendSimpleCommand(ip, port, 'CLEAR_TMP\n');
-  if (!response.startsWith('OK')) throw new Error(`Clear tmp failed: ${response}`);
+  await payloadFsApi.payloadClearTmp(ip, port);
   return true;
 }
 
 async function payloadMaintenance(ip, port) {
-  const response = await sendSimpleCommand(ip, port, 'MAINTENANCE\n');
+  const response = await payloadFsApi.payloadMaintenance(ip, port);
   if (!response.startsWith('OK')) throw new Error(`Maintenance failed: ${response}`);
   return true;
 }
 
 async function queueExtract(ip, port, src, dst, opts = {}) {
-  const cleanupPath = typeof opts.cleanupPath === 'string' ? opts.cleanupPath.trim() : '';
-  const deleteSource = opts.deleteSource === true;
-  const tokens = [src, dst];
-  if (cleanupPath || deleteSource) {
-    tokens.push(cleanupPath);
-    if (deleteSource) {
-      tokens.push('DEL');
-    }
-  }
-  const cmd = `QUEUE_EXTRACT ${tokens.join('\t')}\n`;
-  const response = await sendSimpleCommand(ip, port, cmd);
-  if (!response.startsWith('OK ')) throw new Error(`Queue extract failed: ${response}`);
-  return Number.parseInt(response.substring(3).trim(), 10);
+  return payloadQueueApi.queueExtract(ip, port, src, dst, opts);
 }
 
 async function queueCancel(ip, port, id) {
-  const response = await sendSimpleCommand(ip, port, `QUEUE_CANCEL ${id}\n`);
-  if (!response.startsWith('OK')) throw new Error(`Queue cancel failed: ${response}`);
-  return true;
+  return payloadFsApi.queueCancel(ip, port, id);
 }
 
 async function queueClear(ip, port) {
-  const response = await sendSimpleCommand(ip, port, 'QUEUE_CLEAR\n');
-  if (!response.startsWith('OK')) throw new Error(`Queue clear failed: ${response}`);
-  return true;
+  return payloadFsApi.queueClear(ip, port);
 }
 
 async function queueClearAll(ip, port) {
-  const response = await sendSimpleCommand(ip, port, 'QUEUE_CLEAR_ALL\n');
-  if (!response.startsWith('OK')) throw new Error(`Queue clear all failed: ${response}`);
-  return true;
+  return payloadFsApi.queueClearAll(ip, port);
 }
 
 async function queueClearFailed(ip, port) {
-  const response = await sendSimpleCommand(ip, port, 'QUEUE_CLEAR_FAILED\n');
-  if (!response.startsWith('OK')) throw new Error(`Queue clear failed failed: ${response}`);
-  return true;
+  return payloadFsApi.queueClearFailed(ip, port);
 }
 
 async function queueReorder(ip, port, ids) {
-  const response = await sendSimpleCommand(ip, port, `QUEUE_REORDER ${Array.isArray(ids) ? ids.join(',') : ''}\n`);
-  if (!response.startsWith('OK')) throw new Error(`Queue reorder failed: ${response}`);
-  return true;
+  return payloadFsApi.queueReorder(ip, port, ids);
 }
 
 async function queueProcess(ip, port) {
-  const response = await sendSimpleCommand(ip, port, 'QUEUE_PROCESS\n');
-  if (!response.startsWith('OK')) throw new Error(`Queue process failed: ${response}`);
-  return true;
+  return payloadFsApi.queueProcess(ip, port);
 }
 
 async function queuePause(ip, port, id) {
-  const response = await sendSimpleCommand(ip, port, `QUEUE_PAUSE ${id}\n`);
-  if (!response.startsWith('OK')) throw new Error(`Queue pause failed: ${response}`);
-  return true;
+  return payloadQueueApi.queuePause(ip, port, id);
 }
 
 async function queueRetry(ip, port, id) {
-  const response = await sendSimpleCommand(ip, port, `QUEUE_RETRY ${id}\n`);
-  if (!response.startsWith('OK')) throw new Error(`Queue retry failed: ${response}`);
-  return true;
+  return payloadQueueApi.queueRetry(ip, port, id);
 }
 
 async function queueRemove(ip, port, id) {
-  const response = await sendSimpleCommand(ip, port, `QUEUE_REMOVE ${id}\n`);
-  if (!response.startsWith('OK')) throw new Error(`Queue remove failed: ${response}`);
-  return true;
+  return payloadQueueApi.queueRemove(ip, port, id);
 }
 
 async function syncInfo(ip, port) {
-  const payload = await sendCommandExpectPayload(ip, port, 'SYNC_INFO\n');
-  return payload || '{}';
+  return payloadQueueApi.syncInfo(ip, port);
 }
 
 async function uploadQueueGet(ip, port) {
-  const payload = await sendCommandExpectPayload(ip, port, 'UPLOAD_QUEUE_GET\n');
-  return payload || '{}';
+  return payloadQueueApi.uploadQueueGet(ip, port);
 }
 
 async function uploadQueueSync(ip, port, payload) {
-  const data = Buffer.from(String(payload || ''), 'utf8');
-  const response = await sendCommandWithPayload(ip, port, `UPLOAD_QUEUE_SYNC ${data.length}\n`, data);
-  if (!response.startsWith('OK')) throw new Error(`Upload queue sync failed: ${response}`);
-  return true;
+  return payloadQueueApi.uploadQueueSync(ip, port, payload);
 }
 
 async function historyGet(ip, port) {
-  const payload = await sendCommandExpectPayload(ip, port, 'HISTORY_GET\n');
-  return payload || '{}';
+  return payloadQueueApi.historyGet(ip, port);
 }
 
 async function historySync(ip, port, payload) {
-  const data = Buffer.from(String(payload || ''), 'utf8');
-  const response = await sendCommandWithPayload(ip, port, `HISTORY_SYNC ${data.length}\n`, data);
-  if (!response.startsWith('OK')) throw new Error(`History sync failed: ${response}`);
-  return true;
-}
-
-function payloadPathIsElf(filepath) {
-  const ext = path.extname(filepath).toLowerCase();
-  return ext === '.elf' || ext === '.bin';
-}
-
-function findLocalPayloadElf() {
-  const candidates = [
-    path.resolve(__dirname, '../payload/ps5upload.elf'),
-    path.resolve(process.cwd(), 'payload/ps5upload.elf'),
-    path.resolve(process.cwd(), 'ps5upload.elf'),
-  ];
-  for (const p of candidates) {
-    try {
-      if (fs.existsSync(p) && payloadPathIsElf(p)) return p;
-    } catch {
-      // ignore
-    }
-  }
-  return null;
-}
-
-function probePayloadFile(filepath) {
-  if (!payloadPathIsElf(filepath)) {
-    return { is_ps5upload: false, code: 'payload_probe_invalid_ext' };
-  }
-  const nameMatch = filepath.toLowerCase().includes('ps5upload');
-  const content = fs.readFileSync(filepath, { encoding: null }).slice(0, 512 * 1024);
-  const signatureMatch = content.includes(Buffer.from('ps5upload')) || content.includes(Buffer.from('PS5UPLOAD'));
-  if (nameMatch || signatureMatch) return { is_ps5upload: true, code: 'payload_probe_detected' };
-  return { is_ps5upload: false, code: 'payload_probe_no_signature' };
+  return payloadQueueApi.historySync(ip, port, payload);
 }
 
 async function sendPayloadFile(ip, filepath) {
@@ -2208,6 +1289,21 @@ function compareVersions(a, b) {
 }
 
 function httpsJson(url) {
+  if (undici && typeof undici.request === 'function') {
+    return (async () => {
+      const { statusCode, body } = await undici.request(url, {
+        method: 'GET',
+        headers: {
+          'User-Agent': 'ps5upload-app',
+          Accept: 'application/vnd.github+json',
+        },
+        headersTimeout: 20000,
+        bodyTimeout: 20000,
+      });
+      if (statusCode >= 400) throw new Error(`HTTP ${statusCode}`);
+      return body.json();
+    })();
+  }
   return new Promise((resolve, reject) => {
     const req = https.get(
       url,
@@ -2285,6 +1381,86 @@ async function fetchRepoReleases(owner, repo) {
 }
 
 function downloadAsset(url, outputPath, opts) {
+  if (undici && typeof undici.request === 'function') {
+    return (async () => {
+      const file = fs.createWriteStream(outputPath);
+      const meta =
+        opts && typeof opts === 'object' && !Array.isArray(opts)
+          ? {
+              runtime: opts.runtime,
+              label: typeof opts.label === 'string' ? opts.label : '',
+              source_id: typeof opts.source_id === 'string' ? opts.source_id : null,
+            }
+          : { runtime: null, label: '', source_id: null };
+      const startedAt = Date.now();
+      let received = 0;
+      let total = 0;
+      let lastAt = startedAt;
+      let lastBytes = 0;
+      let ema = 0;
+      let lastEmitAt = 0;
+      const updateRuntime = (done, error) => {
+        if (!meta.runtime) return;
+        const now = Date.now();
+        if (!done && now - lastEmitAt < 250) return;
+        lastEmitAt = now;
+        meta.runtime.payloadDownloadProgress = {
+          label: meta.label || null,
+          source_id: meta.source_id,
+          received_bytes: received,
+          total_bytes: total || null,
+          speed_bps: ema || 0,
+          elapsed_ms: now - startedAt,
+          done: !!done,
+          error: error || null,
+          updated_at_ms: now,
+        };
+      };
+      const tick = () => {
+        const now = Date.now();
+        const dt = (now - lastAt) / 1000;
+        if (dt <= 0) return;
+        const delta = received - lastBytes;
+        const inst = delta > 0 ? delta / dt : 0;
+        const alpha = 1 - Math.exp(-dt / 3);
+        ema = ema > 0 ? ema + (inst - ema) * alpha : inst;
+        lastAt = now;
+        lastBytes = received;
+      };
+
+      updateRuntime(false, null);
+      const { statusCode, headers, body } = await undici.request(url, {
+        method: 'GET',
+        headers: { 'User-Agent': 'ps5upload-app' },
+        headersTimeout: 30000,
+        bodyTimeout: 0,
+      });
+      if (statusCode >= 400) {
+        throw new Error(`HTTP ${statusCode}`);
+      }
+      const contentLength = Number(headers && headers['content-length'] ? headers['content-length'] : 0);
+      total = Number.isFinite(contentLength) && contentLength > 0 ? contentLength : 0;
+
+      await new Promise((resolve, reject) => {
+        const onErr = (err) => {
+          try { file.destroy(); } catch {}
+          reject(err);
+        };
+        file.on('error', onErr);
+        body.on('data', (chunk) => {
+          received += chunk.length;
+          tick();
+          updateRuntime(false, null);
+        });
+        body.on('error', onErr);
+        body.pipe(file);
+        file.on('finish', resolve);
+      });
+      tick();
+      updateRuntime(true, null);
+      return true;
+    })();
+  }
   return new Promise((resolve, reject) => {
     const file = fs.createWriteStream(outputPath);
     const meta =
@@ -3061,10 +2237,12 @@ async function handleInvoke(cmd, args, runtime) {
       runtime.transferMeta = {
         requested_optimize: null,
         auto_tune_connections: null,
+        requested_max_throughput: null,
         effective_optimize: null,
         effective_compression: null,
         requested_ftp_connections: null,
         effective_ftp_connections: null,
+        preflight_bottleneck: null,
       };
       return true;
     case 'transfer_active':
@@ -3117,10 +2295,12 @@ async function handleInvoke(cmd, args, runtime) {
       runtime.transferMeta = {
         requested_optimize: requestedOptimize,
         auto_tune_connections: autoTuneConnections,
+        requested_max_throughput: Boolean(req && (req.max_throughput_experimental || req.mad_max)),
         effective_optimize: requestedOptimize,
         effective_compression: compression,
         requested_ftp_connections: requestedFtpConnections,
         effective_ftp_connections: effectiveFtpConnections,
+        preflight_bottleneck: null,
       };
       runtime.transferStatus = createTransferStatus({
         run_id: runId,
@@ -3189,6 +2369,7 @@ async function handleInvoke(cmd, args, runtime) {
                 const queuedId = await queueExtract(ip, TRANSFER_PORT, rarRemotePath, destRoot, {
                   cleanupPath: tempDir,
                   deleteSource: true,
+                  unrarMode: 'AUTO',
                 });
 
                 runtime.transferStatus = createTransferStatus({
@@ -3271,6 +2452,75 @@ async function handleInvoke(cmd, args, runtime) {
           }
 
           const mode = uploadMode && uploadMode.toLowerCase() === 'ftp' ? 'ftp' : 'payload';
+
+          const normalizeResumeMode = (value) => {
+            if (value === 'size_mtime') return 'size';
+            const allowed = ['size', 'hash_large', 'hash_medium', 'sha256'];
+            return allowed.includes(value) ? value : 'none';
+          };
+          const shouldHashResume = (value, size) => {
+            if (value === 'sha256') return true;
+            if (value === 'hash_large') return size >= RESUME_HASH_LARGE_BYTES;
+            if (value === 'hash_medium') return size >= RESUME_HASH_MED_BYTES;
+            return false;
+          };
+          const resumeMode = normalizeResumeMode(req && req.resume_mode ? String(req.resume_mode) : 'none');
+          if (resumeMode !== 'none' && mode !== 'ftp' && uploadFiles.length > 0) {
+            runtime.transferStatus.status = 'Resume scan';
+            runtime.transferStatus.files = 0;
+            runtime.transferStatus.total = uploadFiles.length;
+            runtime.transferStatus.current_file = '';
+
+            let payloadCapsForResume = createDefaultPayloadCaps(null);
+            try {
+              payloadCapsForResume = await getPayloadCaps(ip, TRANSFER_PORT);
+            } catch {
+              // Fall back to compatibility defaults.
+            }
+            const resumeHashAlgorithm = chooseResumeHashAlgorithm(
+              payloadCapsForResume,
+              resumeMode,
+              isLocalHashAlgorithmSupported
+            );
+            if (resumeMode !== 'size') {
+              runtime.transferStatus.status = `Resume scan (${String(resumeHashAlgorithm).toUpperCase()})`;
+            }
+
+            const remoteFiles = await listDirRecursiveCompat(ip, destRoot);
+            const remoteIndex = new Map();
+            for (const entry of remoteFiles) {
+              if (!entry || typeof entry.relPath !== 'string') continue;
+              remoteIndex.set(entry.relPath.replace(/\\/g, '/'), {
+                size: Number(entry.size) || 0,
+              });
+            }
+            const filteredResult = await sharedResumeScan.filterResumeFiles({
+              files: uploadFiles,
+              remoteIndex,
+              resumeMode,
+              shouldHashResume,
+              mapWithConcurrency,
+              hashLocal: (file) => hashFileLocal(file.abs_path, resumeHashAlgorithm),
+              hashRemote: (remotePath) => hashFileRemote(ip, TRANSFER_PORT, remotePath, resumeHashAlgorithm),
+              makeRemotePath: (rel) => joinRemotePath(destRoot, rel),
+              concurrency: RESUME_HASH_REMOTE_PARALLELISM,
+              onProgress: (done, total) => {
+                runtime.transferStatus.files = done;
+                runtime.transferStatus.total = total;
+              },
+              cancelCheck: () => runtime.transferCancel,
+            });
+            const filtered = filteredResult.filtered;
+
+            uploadFiles.length = 0;
+            uploadFiles.push(...filtered);
+            totalFiles = uploadFiles.length;
+            totalBytes = uploadFiles.reduce((sum, file) => sum + (Number(file && file.size) || 0), 0);
+            runtime.transferStatus.status = 'Scanning';
+            runtime.transferStatus.files = totalFiles;
+            runtime.transferStatus.total = totalBytes;
+          }
+
           const avgSize = totalFiles > 0 ? totalBytes / totalFiles : 0;
           if (autoTuneConnections && totalFiles > 0) {
             if (totalFiles === 1) {
@@ -3314,44 +2564,204 @@ async function handleInvoke(cmd, args, runtime) {
           }
 
           if (mode === 'payload') {
-            runtime.transferStatus.status = 'Preparing upload';
-            runtime.transferStatus.current_file = '';
-
-            await precreateRemoteDirectories(ip, destRoot, uploadFiles, {
-              shouldCancel: () => runtime.transferCancel,
-              log: (message) => {
-                runtime.transferStatus.status = message;
-              },
-            });
-
-            runtime.transferStatus.status = 'Uploading';
-            runtime.transferStatus.current_file = '';
-
-              if (uploadFiles.length === 1 && Number(uploadFiles[0].size || 0) >= LANE_MIN_FILE_SIZE) {
-                await uploadLaneSingleFile(ip, destRoot, uploadFiles[0], {
-                  connections: effectivePayloadConnections,
-                  shouldCancel: () => runtime.transferCancel,
-                  onProgress: (sent) => {
-                    runtime.transferStatus.sent = sent;
-                    recordTransferSpeed(runtime, sent, 'payload');
-                    runtime.transferStatus.elapsed_secs = (Date.now() - startedAt) / 1000;
-                    runtime.transferStatus.current_file = uploadFiles[0].rel_path || '';
-                  },
-                });
-              } else {
-                await uploadFastMultiFile(ip, destRoot, uploadFiles, {
-                  connections: effectivePayloadConnections,
-                  shouldCancel: () => runtime.transferCancel,
-                  onFileStart: (file) => {
-                    runtime.transferStatus.current_file = file.rel_path || '';
-                  },
-                  onProgress: (sent) => {
-                    runtime.transferStatus.sent = sent;
-                    recordTransferSpeed(runtime, sent, 'payload');
-                    runtime.transferStatus.elapsed_secs = (Date.now() - startedAt) / 1000;
-                  },
-                });
+            const waitForPayloadRecovery = async () => {
+              const deadline = Date.now() + 180000;
+              let statusErrors = 0;
+              let resetIssued = false;
+              while (Date.now() < deadline) {
+                if (runtime.transferCancel) return false;
+                try {
+                  const status = await getPayloadStatus(ip, TRANSFER_PORT);
+                  statusErrors = 0;
+                  if (status && !status.is_busy) {
+                    const transfer = status.transfer || {};
+                    if (Number(transfer.active_sessions || 0) === 0 && !transfer.abort_requested) {
+                      return true;
+                    }
+                    if (!resetIssued && transfer.abort_requested) {
+                      resetIssued = true;
+                      await payloadReset(ip, TRANSFER_PORT).catch(() => {});
+                    }
+                  }
+                } catch {
+                  statusErrors += 1;
+                  if (!resetIssued && statusErrors >= 3) {
+                    resetIssued = true;
+                    await payloadReset(ip, TRANSFER_PORT).catch(() => {});
+                  }
+                  // Keep polling through transient status failures.
+                }
+                await sleepMs(2000);
               }
+              return false;
+            };
+            const filterResumeBySize = async (files) => {
+              if (!Array.isArray(files) || files.length === 0) return [];
+              try {
+                const remoteFiles = await listDirRecursiveCompat(ip, destRoot);
+                const remoteIndex = new Map();
+                for (const entry of remoteFiles) {
+                  if (!entry || typeof entry.relPath !== 'string') continue;
+                  remoteIndex.set(entry.relPath.replace(/\\/g, '/'), { size: Number(entry.size) || 0 });
+                }
+                const result = await sharedResumeScan.filterResumeFiles({
+                  files,
+                  remoteIndex,
+                  resumeMode: 'size',
+                  shouldHashResume: () => false,
+                  mapWithConcurrency,
+                  concurrency: RESUME_HASH_REMOTE_PARALLELISM,
+                  onProgress: () => {},
+                  cancelCheck: () => runtime.transferCancel,
+                });
+                return result.filtered;
+              } catch {
+                return files;
+              }
+            };
+
+            let attemptFiles = uploadFiles;
+            let recoveryAttempted = false;
+            let precreatedDirs = false;
+            while (true) {
+              try {
+                const maxThroughputRequested = Boolean(req && (req.max_throughput_experimental || req.mad_max));
+                const madMaxRequested = Boolean(req && req.mad_max === true);
+                runtime.transferStatus.status = 'Preparing upload';
+                runtime.transferStatus.current_file = '';
+                const largeSingleFile = attemptFiles.length === 1 && Number(attemptFiles[0].size || 0) >= LANE_MIN_FILE_SIZE;
+                let singleStrategy = null;
+                if (largeSingleFile) {
+                  const fileSize = Number(attemptFiles[0].size || 0);
+                  if (!maxThroughputRequested) {
+                    singleStrategy = { mode: 'stable', reason: 'not_requested' };
+                  } else {
+                    let bottleneck = 'unknown';
+                    try {
+                      const status = await getPayloadStatus(ip, TRANSFER_PORT);
+                      bottleneck = classifyPayloadUploadBottleneck(
+                        status,
+                        Number(runtime.transferStatus?.payload_speed_bps || runtime.transferStatus?.total_speed_bps || 0)
+                      );
+                    } catch {
+                      // Keep unknown when preflight status is unavailable.
+                    }
+                    runtime.transferMeta = { ...runtime.transferMeta, preflight_bottleneck: bottleneck };
+                    if (bottleneck === 'payload_disk' || bottleneck === 'payload_cpu' || bottleneck === 'client') {
+                      singleStrategy = { mode: 'stable', reason: bottleneck };
+                    } else if (madMaxRequested && fileSize >= MAD_MAX_MIN_FILE_SIZE) {
+                      singleStrategy = {
+                        mode: 'mad_max',
+                        workers: Math.max(1, Math.min(4, MAD_MAX_WORKERS)),
+                        chunkSize: getMadMaxChunkSize(fileSize),
+                      };
+                    } else {
+                      singleStrategy = {
+                        mode: 'lane',
+                        workers: Math.max(1, Math.min(4, effectivePayloadConnections || LANE_CONNECTIONS)),
+                        chunkSize: getLaneChunkSize(fileSize),
+                      };
+                    }
+                  }
+                }
+
+                runtime.transferStatus.status = 'Uploading';
+                runtime.transferStatus.current_file = '';
+
+                if (singleStrategy && singleStrategy.mode === 'mad_max') {
+                  runtime.transferStatus.payload_transfer_path = 'mad_max_single';
+                  runtime.transferStatus.payload_workers = singleStrategy.workers;
+                  await uploadLaneSingleFile(ip, destRoot, attemptFiles[0], {
+                    connections: singleStrategy.workers,
+                    chunkSize: singleStrategy.chunkSize,
+                    shouldCancel: () => runtime.transferCancel,
+                    onProgress: (sent) => {
+                      runtime.transferStatus.sent = sent;
+                      recordTransferSpeed(runtime, sent, 'payload');
+                      runtime.transferStatus.elapsed_secs = (Date.now() - startedAt) / 1000;
+                      runtime.transferStatus.current_file = attemptFiles[0].rel_path || '';
+                    },
+                  });
+                } else if (singleStrategy && singleStrategy.mode === 'lane') {
+                  runtime.transferStatus.payload_transfer_path = 'lane_fast_offset';
+                  runtime.transferStatus.payload_workers = singleStrategy.workers;
+                  await uploadLaneSingleFile(ip, destRoot, attemptFiles[0], {
+                    connections: singleStrategy.workers,
+                    chunkSize: singleStrategy.chunkSize,
+                    shouldCancel: () => runtime.transferCancel,
+                    onProgress: (sent) => {
+                      runtime.transferStatus.sent = sent;
+                      recordTransferSpeed(runtime, sent, 'payload');
+                      runtime.transferStatus.elapsed_secs = (Date.now() - startedAt) / 1000;
+                      runtime.transferStatus.current_file = attemptFiles[0].rel_path || '';
+                    },
+                  });
+                } else if (singleStrategy && singleStrategy.mode === 'stable') {
+                  runtime.transferStatus.payload_transfer_path = 'binary_single';
+                  runtime.transferStatus.payload_workers = 1;
+                  await uploadFastMultiFile(ip, destRoot, attemptFiles, {
+                    connections: 1,
+                    shouldCancel: () => runtime.transferCancel,
+                    onFileStart: (file) => {
+                      runtime.transferStatus.current_file = file.rel_path || '';
+                    },
+                    onProgress: (sent) => {
+                      runtime.transferStatus.sent = sent;
+                      recordTransferSpeed(runtime, sent, 'payload');
+                      runtime.transferStatus.elapsed_secs = (Date.now() - startedAt) / 1000;
+                    },
+                  });
+                } else {
+                  if (!precreatedDirs) {
+                    await precreateRemoteDirectories(ip, destRoot, attemptFiles, {
+                      shouldCancel: () => runtime.transferCancel,
+                      log: (message) => {
+                        runtime.transferStatus.status = message;
+                      },
+                    });
+                    precreatedDirs = true;
+                  }
+                  runtime.transferStatus.status = 'Uploading';
+                  runtime.transferStatus.payload_transfer_path = effectivePayloadConnections > 1 ? 'binary_multi_file' : 'binary_single';
+                  runtime.transferStatus.payload_workers = effectivePayloadConnections > 1 ? effectivePayloadConnections : 1;
+                  await uploadFastMultiFile(ip, destRoot, attemptFiles, {
+                    connections: effectivePayloadConnections,
+                    shouldCancel: () => runtime.transferCancel,
+                    onFileStart: (file) => {
+                      runtime.transferStatus.current_file = file.rel_path || '';
+                    },
+                    onProgress: (sent) => {
+                      runtime.transferStatus.sent = sent;
+                      recordTransferSpeed(runtime, sent, 'payload');
+                      runtime.transferStatus.elapsed_secs = (Date.now() - startedAt) / 1000;
+                    },
+                  });
+                }
+                break;
+              } catch (err) {
+                if (recoveryAttempted || runtime.transferCancel) throw err;
+                recoveryAttempted = true;
+                runtime.transferStatus.status = 'Recovering payload';
+                const recovered = await waitForPayloadRecovery();
+                if (!recovered) throw err;
+                const retryFiles = await filterResumeBySize(attemptFiles);
+                if (!Array.isArray(retryFiles) || retryFiles.length === 0) {
+                  runtime.transferStatus = createTransferStatus({
+                    run_id: runId,
+                    status: 'Complete',
+                    sent: totalBytes,
+                    total: totalBytes,
+                    files: totalFiles,
+                    elapsed_secs: (Date.now() - startedAt) / 1000,
+                    current_file: '',
+                    upload_mode: 'payload',
+                  });
+                  return;
+                }
+                attemptFiles = retryFiles;
+                precreatedDirs = false;
+              }
+            }
 
             runtime.transferStatus = createTransferStatus({
               run_id: runId,
@@ -3597,7 +3007,10 @@ async function handleInvoke(cmd, args, runtime) {
           }
         }
 
-        const queuedId = await queueExtract(ip, TRANSFER_PORT, remoteRarPath, destPath, { deleteSource: true });
+        const queuedId = await queueExtract(ip, TRANSFER_PORT, remoteRarPath, destPath, {
+          deleteSource: true,
+          unrarMode: 'AUTO',
+        });
         const payloadSpeed = Number(runtime.transferStatus.payload_speed_bps) || 0;
         const ftpSpeed = Number(runtime.transferStatus.ftp_speed_bps) || 0;
         const totalSpeed = Number(runtime.transferStatus.total_speed_bps) || 0;
@@ -3976,12 +3389,94 @@ function buildServer(config) {
     transferMeta: {
       requested_optimize: null,
       auto_tune_connections: null,
+      requested_max_throughput: null,
       effective_optimize: null,
       effective_compression: null,
       requested_ftp_connections: null,
       effective_ftp_connections: null,
+      preflight_bottleneck: null,
     },
   };
+  const sseClients = new Set();
+  const SSE_MAX_CLIENTS = 64;
+  const sseWrite = (res, type, payload) => {
+    try {
+      if (res.writableEnded || res.destroyed) return false;
+      const envelope = JSON.stringify({ type, payload, ts: Date.now() });
+      res.write(`data: ${envelope}\n\n`);
+      return true;
+    } catch {
+      return false;
+    }
+  };
+  const sseBroadcast = (type, payload) => {
+    for (const res of Array.from(sseClients)) {
+      if (!sseWrite(res, type, payload)) {
+        sseClients.delete(res);
+        try { res.end(); } catch {}
+      }
+    }
+  };
+  const transferSnapshot = () => ({ ...runtime.transferStatus, ...runtime.transferMeta });
+  let lastTransferSig = '';
+  let lastPayloadSig = '';
+  let lastConnSig = '';
+  const sseTicker = setInterval(() => {
+    const transfer = transferSnapshot();
+    const payload = runtime.payloadStatus || { status: null, error: null, updated_at_ms: 0 };
+    const conn = runtime.connectionStatus || { is_connected: false, status: 'Disconnected', storage_locations: [] };
+    const transferSig = JSON.stringify({
+      run_id: transfer.run_id,
+      status: transfer.status,
+      sent: transfer.sent,
+      total: transfer.total,
+      files: transfer.files,
+      total_speed_bps: transfer.total_speed_bps,
+      payload_speed_bps: transfer.payload_speed_bps,
+      ftp_speed_bps: transfer.ftp_speed_bps,
+      payload_transfer_path: transfer.payload_transfer_path,
+      payload_workers: transfer.payload_workers,
+      preflight_bottleneck: transfer.preflight_bottleneck || null,
+    });
+    if (transferSig !== lastTransferSig) {
+      lastTransferSig = transferSig;
+      sseBroadcast('transfer_status_update', transfer);
+    }
+    const payloadSig = JSON.stringify({
+      status: payload.status || null,
+      error: payload.error || null,
+      updated_at_ms: payload.updated_at_ms || 0,
+    });
+    if (payloadSig !== lastPayloadSig) {
+      lastPayloadSig = payloadSig;
+      sseBroadcast('payload_status_update', payload);
+    }
+    const connSig = JSON.stringify({
+      is_connected: !!conn.is_connected,
+      status: conn.status || '',
+      storage_count: Array.isArray(conn.storage_locations) ? conn.storage_locations.length : 0,
+    });
+    if (connSig !== lastConnSig) {
+      lastConnSig = connSig;
+      sseBroadcast('connection_status_update', conn);
+    }
+  }, 350);
+  if (sseTicker && typeof sseTicker.unref === 'function') sseTicker.unref();
+  const sseHeartbeat = setInterval(() => {
+    for (const res of Array.from(sseClients)) {
+      try {
+        if (res.writableEnded || res.destroyed) {
+          sseClients.delete(res);
+          continue;
+        }
+        res.write(': ping\n\n');
+      } catch {
+        sseClients.delete(res);
+        try { res.end(); } catch {}
+      }
+    }
+  }, 15000);
+  if (sseHeartbeat && typeof sseHeartbeat.unref === 'function') sseHeartbeat.unref();
   const frontendDir = resolveFrontendDir();
 
   const server = http.createServer(async (req, res) => {
@@ -4310,6 +3805,34 @@ function buildServer(config) {
       return;
     }
 
+    if (reqUrl.pathname === '/api/events' && req.method === 'GET') {
+      if (sseClients.size >= SSE_MAX_CLIENTS) {
+        res.writeHead(503, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify({ ok: false, error: 'Too many event clients' }));
+        return;
+      }
+      res.writeHead(200, {
+        'Content-Type': 'text/event-stream; charset=utf-8',
+        'Cache-Control': 'no-cache, no-transform',
+        Connection: 'keep-alive',
+      });
+      res.write(': connected\n\n');
+      sseClients.add(res);
+      // Send initial snapshots immediately so UI can paint without polling delay.
+      sseWrite(res, 'transfer_status_update', transferSnapshot());
+      sseWrite(res, 'payload_status_update', runtime.payloadStatus || { status: null, error: null, updated_at_ms: 0 });
+      sseWrite(res, 'connection_status_update', runtime.connectionStatus || { is_connected: false, status: 'Disconnected', storage_locations: [] });
+      req.on('close', () => {
+        sseClients.delete(res);
+        try { res.end(); } catch {}
+      });
+      res.on('error', () => {
+        sseClients.delete(res);
+        try { res.end(); } catch {}
+      });
+      return;
+    }
+
     if (reqUrl.pathname === '/api/port-check' && req.method === 'GET') {
       const ip = (reqUrl.searchParams.get('ip') || '').trim();
       const portRaw = (reqUrl.searchParams.get('port') || '').trim();
@@ -4337,6 +3860,14 @@ function buildServer(config) {
     }
 
     serveFrontend(req, res, frontendDir);
+  });
+  server.on('close', () => {
+    clearInterval(sseTicker);
+    clearInterval(sseHeartbeat);
+    for (const res of Array.from(sseClients)) {
+      try { res.end(); } catch {}
+    }
+    sseClients.clear();
   });
   server.__runtime = runtime;
   return server;

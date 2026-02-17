@@ -36,8 +36,11 @@ void handle_download_raw(int client_sock, const char *path);
 void handle_download_raw_from(int client_sock, const char *args);
 void handle_download_raw_range(int client_sock, const char *args);
 void handle_hash_file(int client_sock, const char *path);
+void handle_hash_file_fast(int client_sock, const char *path);
+void handle_hash_file_b3(int client_sock, const char *path);
 void handle_get_space(int client_sock, const char *path);
 void handle_version(int client_sock);
+void handle_caps(int client_sock);
 void handle_clear_tmp(int client_sock);
 int clear_tmp_all(int *cleared, int *errors, char *last_err, size_t last_err_len);
 

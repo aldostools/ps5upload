@@ -14,6 +14,8 @@
   var payloadPollResumeTimer = null;
   var managePollTimer = null;
   var managePollInFlight = false;
+  var eventStream = null;
+  var eventStreamRetryTimer = null;
   var bridgeState = {
     connectionIp: '',
     payloadIp: '',
@@ -142,6 +144,7 @@
   function startTransferMonitor(runId) {
     clearTransferMonitor();
     transferMonitorRunId = Number(runId) || null;
+    if (eventStream) return;
     transferMonitorTimer = setInterval(async function () {
       if (transferMonitorInFlight) return;
       transferMonitorInFlight = true;
@@ -172,6 +175,76 @@
     }, 500);
   }
 
+  function scheduleEventStreamRetry() {
+    if (eventStreamRetryTimer) return;
+    eventStreamRetryTimer = setTimeout(function () {
+      eventStreamRetryTimer = null;
+      startEventStream();
+    }, 1500);
+  }
+
+  function handleEventEnvelope(envelope) {
+    if (!envelope || typeof envelope !== 'object') return;
+    var type = envelope.type;
+    var payload = envelope.payload;
+    if (type === 'payload_status_update') {
+      emit('payload_status_update', payload);
+      return;
+    }
+    if (type === 'connection_status_update') {
+      emit('connection_status_update', payload);
+      return;
+    }
+    if (type === 'transfer_status_update') {
+      var status = payload && typeof payload === 'object' ? payload : null;
+      if (!status) return;
+      var statusText = String(status.status || '');
+      var statusRunId = Number(status.run_id) || transferMonitorRunId || 0;
+      if (!isTransferTerminal(statusText)) return;
+      clearTransferMonitor();
+      if (statusText.indexOf('Complete') === 0) {
+        emit('transfer_complete', {
+          run_id: statusRunId,
+          files: Number(status.files) || 0,
+          bytes: Number(status.sent) || Number(status.total) || 0,
+        });
+      } else {
+        emit('transfer_error', {
+          run_id: statusRunId,
+          message: statusText || 'Transfer failed',
+        });
+      }
+    }
+  }
+
+  function startEventStream() {
+    if (eventStream || typeof window.EventSource !== 'function') return;
+    try {
+      eventStream = new window.EventSource('/api/events');
+    } catch {
+      eventStream = null;
+      scheduleEventStreamRetry();
+      return;
+    }
+    eventStream.onmessage = function (event) {
+      var raw = event && typeof event.data === 'string' ? event.data : '';
+      if (!raw) return;
+      try {
+        var envelope = JSON.parse(raw);
+        handleEventEnvelope(envelope);
+      } catch {
+        // Ignore malformed events.
+      }
+    };
+    eventStream.onerror = function () {
+      if (eventStream) {
+        eventStream.close();
+        eventStream = null;
+      }
+      scheduleEventStreamRetry();
+    };
+  }
+
   function stopConnectionPoll() {
     if (connectionPollTimer) {
       clearInterval(connectionPollTimer);
@@ -193,8 +266,32 @@
     }
   }
 
+  function teardownEventStream() {
+    if (eventStream) {
+      try { eventStream.close(); } catch {}
+      eventStream = null;
+    }
+    if (eventStreamRetryTimer) {
+      clearTimeout(eventStreamRetryTimer);
+      eventStreamRetryTimer = null;
+    }
+  }
+
+  function stopAllBackgroundWork() {
+    clearTransferMonitor();
+    stopConnectionPoll();
+    stopPayloadPoll();
+    stopManagePoll();
+    teardownEventStream();
+    if (payloadPollResumeTimer) {
+      clearTimeout(payloadPollResumeTimer);
+      payloadPollResumeTimer = null;
+    }
+  }
+
   function startConnectionPoll() {
     stopConnectionPoll();
+    if (eventStream) return;
     if (!bridgeState.connectionPollingEnabled || !bridgeState.connectionIp) return;
     connectionPollTimer = setInterval(async function () {
       if (connectionPollInFlight) return;
@@ -212,6 +309,7 @@
 
   function startPayloadPoll() {
     stopPayloadPoll();
+    if (eventStream) return;
     if (!bridgeState.payloadPollingEnabled || !bridgeState.payloadIp) return;
     payloadPollTimer = setInterval(async function () {
       if (payloadPollInFlight) return;
@@ -869,9 +967,12 @@
   } else {
     installHostPathBanner();
   }
+  startEventStream();
 
   // Notify UI that backend bridge is ready.
   setTimeout(function () {
     emit('payload_log', { message: 'Web bridge ready' });
   }, 0);
+
+  window.addEventListener('beforeunload', stopAllBackgroundWork);
 })();

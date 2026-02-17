@@ -46,6 +46,7 @@ test_games/
 
 # Logs
 *.log
+logs/
 
 # Temp files
 temp/

@@ -26,7 +26,8 @@ typedef enum {
 typedef enum {
     EXTRACT_RAR_FAST = 0,
     EXTRACT_RAR_SAFE = 1,
-    EXTRACT_RAR_TURBO = 2
+    EXTRACT_RAR_TURBO = 2,
+    EXTRACT_RAR_AUTO = 3
 } ExtractRarMode;
 
 typedef struct {

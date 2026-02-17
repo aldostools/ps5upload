@@ -9,10 +9,15 @@ include $(PS5_PAYLOAD_SDK)/toolchain/prospero.mk
 TARGET := ps5upload.elf
 KILLER_TARGET := ps5uploadkiller.elf
 DEBUGGER_TARGET := ps5uploaddebugger.elf
+MIMALLOC ?= 0
 
 # C sources
 C_SRCS := main.c storage.c protocol.c extract.c notify.c transfer.c lz4.c sha256.c unrar_handler.c extract_queue.c system_stats.c \
 	third_party/zstd/zstd.c \
+	third_party/xxhash/xxhash.c \
+	third_party/blake3/blake3.c \
+	third_party/blake3/blake3_portable.c \
+	third_party/blake3/blake3_dispatch_portable.c \
 	third_party/lzma_sdk/Alloc.c \
 	third_party/lzma_sdk/CpuArch.c \
 	third_party/lzma_sdk/LzmaDec.c \
@@ -23,6 +28,10 @@ C_SRCS := main.c storage.c protocol.c extract.c notify.c transfer.c lz4.c sha256
 
 C_OBJS := main.o storage.o protocol.o extract.o notify.o transfer.o lz4.o sha256.o unrar_handler.o extract_queue.o system_stats.o \
 	third_party/zstd/zstd.o \
+	third_party/xxhash/xxhash.o \
+	third_party/blake3/blake3.o \
+	third_party/blake3/blake3_portable.o \
+	third_party/blake3/blake3_dispatch_portable.o \
 	third_party/lzma_sdk/Alloc.o \
 	third_party/lzma_sdk/CpuArch.o \
 	third_party/lzma_sdk/LzmaDec.o \
@@ -96,7 +105,19 @@ VERSION := $(shell cat ../VERSION)
 
 # Common flags
 COMMON_FLAGS := -O3 -flto -DPS5_UPLOAD_VERSION=\"$(VERSION)\" -DSERVER_PORT_STR=\"9113\" -D_7ZIP_ST \
-	-Ithird_party/zstd -Ithird_party/lzma_sdk -Ithird_party/unrar -D_FILE_OFFSET_BITS=64 -D_LARGEFILE_SOURCE
+	-Ithird_party/zstd -Ithird_party/lzma_sdk -Ithird_party/unrar -Ithird_party/blake3 -Ithird_party/xxhash -D_FILE_OFFSET_BITS=64 -D_LARGEFILE_SOURCE
+
+# Optional mimalloc profile (off by default)
+ifneq ($(MIMALLOC),0)
+ifneq ($(wildcard third_party/mimalloc/src/static.c),)
+C_SRCS += third_party/mimalloc/src/static.c
+C_OBJS += third_party/mimalloc/src/static.o
+OBJS := $(C_OBJS) $(UNRAR_OBJS)
+COMMON_FLAGS += -DPS5UPLOAD_USE_MIMALLOC=1 -Ithird_party/mimalloc/include
+else
+$(warning MIMALLOC=$(MIMALLOC) requested but third_party/mimalloc is missing; building without mimalloc)
+endif
+endif
 
 # C flags
 CFLAGS := -Wall $(COMMON_FLAGS)
@@ -162,12 +183,37 @@ $(DEBUGGER_TARGET): $(DEBUGGER_OBJS)
 	@echo "Compiling C (debugger): $<..."
 	$(CC) $(DEBUGGER_CFLAGS) -c $< -o $@
 
+# Debugger C third-party sources
+third_party/zstd/%.debug.o: third_party/zstd/%.c
+	@echo "Compiling C (debugger): $<..."
+	$(CC) $(DEBUGGER_CFLAGS) $(THIRD_PARTY_CFLAGS) -c $< -o $@
+
+third_party/lzma_sdk/%.debug.o: third_party/lzma_sdk/%.c
+	@echo "Compiling C (debugger): $<..."
+	$(CC) $(DEBUGGER_CFLAGS) $(THIRD_PARTY_CFLAGS) -c $< -o $@
+
+third_party/blake3/%.debug.o: third_party/blake3/%.c
+	@echo "Compiling C (debugger): $<..."
+	$(CC) $(DEBUGGER_CFLAGS) $(THIRD_PARTY_CFLAGS) -c $< -o $@
+
+third_party/xxhash/%.debug.o: third_party/xxhash/%.c
+	@echo "Compiling C (debugger): $<..."
+	$(CC) $(DEBUGGER_CFLAGS) $(THIRD_PARTY_CFLAGS) -c $< -o $@
+
 # C third-party sources
 third_party/zstd/%.o: third_party/zstd/%.c
 	@echo "Compiling C: $<..."
 	$(CC) $(CFLAGS) $(THIRD_PARTY_CFLAGS) -c $< -o $@
 
 third_party/lzma_sdk/%.o: third_party/lzma_sdk/%.c
+	@echo "Compiling C: $<..."
+	$(CC) $(CFLAGS) $(THIRD_PARTY_CFLAGS) -c $< -o $@
+
+third_party/blake3/%.o: third_party/blake3/%.c
+	@echo "Compiling C: $<..."
+	$(CC) $(CFLAGS) $(THIRD_PARTY_CFLAGS) -c $< -o $@
+
+third_party/xxhash/%.o: third_party/xxhash/%.c
 	@echo "Compiling C: $<..."
 	$(CC) $(CFLAGS) $(THIRD_PARTY_CFLAGS) -c $< -o $@
 
@@ -210,6 +256,7 @@ info:
 	@echo "  CC: $(CC)"
 	@echo "  CXX: $(CXX)"
 	@echo "  Target: $(TARGET)"
+	@echo "  MIMALLOC: $(MIMALLOC)"
 	@echo "  C Sources: $(C_SRCS)"
 	@echo "  C++ Sources: $(UNRAR_SRCS)"
 
@@ -218,6 +265,7 @@ help:
 	@echo ""
 	@echo "Targets:"
 	@echo "  make          - Build ps5upload.elf (with unrar support)"
+	@echo "  make MIMALLOC=1 - Build with optional mimalloc profile (if vendored)"
 	@echo "  make clean    - Remove build artifacts"
 	@echo "  make test     - Verify build"
 	@echo "  make info     - Show build configuration"

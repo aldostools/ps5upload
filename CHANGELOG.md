@@ -9,10 +9,16 @@ This project follows Semantic Versioning.
 - Extraction queue now preserves requested RAR mode (FAST/SAFE/TURBO) instead of forcing turbo.
 - RAR extraction now applies mode-specific unrar options (keepalive/sleep/path trust/progress behavior).
 - Extraction progress updates now use a non-blocking queue lock path to reduce contention and mid-run stalls.
+- App (`app/server.js`) and desktop (`desktop/electron/main.js`) now share more transfer/runtime code through `shared/*` modules (payload RPC, queue/history sync, resume scan helpers, and upload core).
+- FTP upload paths now explicitly force binary mode (`TYPE I`) after connect/login fallback.
 
 ### Fixed
 - Resolved extraction queue race conditions caused by using stale item pointers across queue reorders/removals.
 - Reduced queue API stalls by moving recursive post-extract chmod work outside the queue mutex critical section.
+- Fixed intermittent `Invalid JSON response` connection/storage errors by reading full multi-line payload JSON responses for list APIs.
+- Fixed FTP fallback auth command formatting for USER/PASS on strict FTP servers.
+- Enforced binary-safe socket writes in shared transfer transport paths to avoid accidental text conversion of file payload bytes.
+- Hardened socket reader close/error behavior to avoid pending-read hangs and unbounded buffered-response growth.
 
 ## [1.5.3] - 2026-02-08
 

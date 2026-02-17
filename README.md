@@ -16,7 +16,11 @@ New UI highlights:
 - Payload tuning suggestions (pack size, pacing, rate) surfaced during transfers.
 - Upload V4 protocol with per-pack ACKs and replay for recovery after payload hiccups.
 - Fast payload paths for large folders and files (parallel `UPLOAD_FAST` + lane-based single-file uploads).
+- Shared app/desktop transfer core (`shared/*`) for payload RPC, queue/history sync, resume logic, and upload lanes.
 - Payload-side backpressure and write validation for safer large-folder uploads.
+- End-to-end binary transfer path for payload uploads (file bytes are sent as raw binary, not text).
+- FTP mode now explicitly forces binary transfer mode (`TYPE I`) after connect/login fallback.
+- Fixed multi-line payload JSON response handling to prevent intermittent `Invalid JSON response` during connect/storage list.
 - Progress UI with ETA, average speed, elapsed time, and last update.
 - Upload queue item info popup with per-item transfer parameters.
 - Smoother transfer/extraction updates and less spiky speed readout.
@@ -65,7 +69,7 @@ This tool fixes that by bundling files into efficient "packs" on your computer a
 
 ### Feature Support Matrix
 - **Instant Streaming:** Supported on all platforms (ZIP, 7Z, RAR, and Folders).
-- **Zero-Install Archives:** ZIP and 7Z are supported via pure-Rust libraries (no external software needed). RAR is statically linked into the binary for maximum portability.
+- **Archive Support:** ZIP / 7Z / RAR workflows are supported in app and desktop transfer/manage flows.
 - **AV Clean:** Optimized release builds with stripped symbols and proper manifests to minimize false positives.
 - **Resizable UI:** Desktop window is resizable with responsive layout.
 
@@ -151,7 +155,7 @@ Release bundle option:
     *   Pick a preset location (like `homebrew` or `etaHEN/games`).
     *   Give your folder a name.
 4.  **Upload:** Click **Upload** in the bottom right. The bar will track real-time progress.
-5.  **RAR uploads (optional):** If your source is a `.rar`, extraction runs in a single turbo mode for maximum speed. You can still pick an optional **RAR Temp Storage** in Transfer settings to control where the archive is staged before extraction.
+5.  **RAR uploads (optional):** If your source is a `.rar`, extraction keeps the requested queue mode (`FAST` / `SAFE` / `TURBO`). You can still pick optional **RAR Temp Storage** in Transfer settings to control where the archive is staged before extraction.
 
 ### 5. Manage Files (Optional)
 Open the **Manage** tab to browse your PS5's storage. You can rename, move, copy, delete, and `chmod 777` files or folders. You can also download files and folders from your PS5 to your computer (folder downloads run in a safe, sequential mode for stability). If something gets stuck, use **Reset UI** in Manage to recover.
@@ -185,6 +189,11 @@ Open the **FAQ** tab for built‑in help and troubleshooting (offline, bundled w
 *   Did you load the payload first? The PS5 stops listening if you reboot or rest mode.
 *   Is your computer's firewall blocking the app?
 *   Are you on the same network? (You don't *have* to be, but you need a route to the IP).
+
+**Q: "Invalid JSON response" when connecting?**
+*   Update to the latest app/desktop build and payload.
+*   This usually indicates a client/payload mismatch or an older client reading only part of a multi-line payload JSON response.
+*   Restart both sides after updating, then reconnect.
 
 **Q: Do I need to use a LAN cable?**
 *   Not strictly, but WiFi is much slower and less stable. For the best "high performance" experience, plug in an Ethernet cable.
@@ -246,14 +255,26 @@ This software is for educational purposes. It is intended for use with legally o
 This software uses the following open-source packages:
 
 **Desktop App (Electron + React):**
-
+*   [Electron](https://www.electronjs.org/) - Desktop runtime
 *   [React](https://react.dev/) - UI library
-*   [tokio](https://tokio.rs/) - Asynchronous runtime for Rust
-*   [serde](https://serde.rs/) - Serialization framework
-*   [anyhow](https://github.com/dtolnay/anyhow) - Flexible error handling
+*   [Zustand](https://github.com/pmndrs/zustand) - Client state management
+*   [basic-ftp](https://github.com/patrickjuchli/basic-ftp) - FTP client uploads
+*   [hash-wasm](https://github.com/Daninet/hash-wasm) - Local hashing for resume/validation
+*   [@svar-ui/react-filemanager](https://www.npmjs.com/package/@svar-ui/react-filemanager) - File manager UI components
+
+**App Service (Browser Mode):**
+*   [Node.js](https://nodejs.org/) - Runtime/server
+*   [undici](https://github.com/nodejs/undici) - HTTP client for release/download flows
+*   [hash-wasm](https://github.com/Daninet/hash-wasm) - Local hashing for resume/validation
 
 **Payload:**
 *   [PS5 Payload SDK](https://github.com/ps5-payload-dev/sdk) - Open source SDK for PS5 payload development
+*   [Zstandard](https://github.com/facebook/zstd) - Compression
+*   [LZ4](https://github.com/lz4/lz4) - Compression
+*   [LZMA SDK](https://www.7-zip.org/sdk.html) - Compression
+*   [UnRAR](https://www.rarlab.com/rar_add.htm) - RAR extraction support
+*   [BLAKE3](https://github.com/BLAKE3-team/BLAKE3) - Fast hashing
+*   [xxHash](https://github.com/Cyan4973/xxHash) - Fast non-cryptographic hashing
 
 ## License
 

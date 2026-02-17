@@ -1938,8 +1938,23 @@ static void process_command(struct ClientConnection *conn) {
         close_connection(conn);
         return;
     }
+    if (strncmp(conn->cmd_buffer, "HASH_FILE_FAST ", 15) == 0) {
+        handle_hash_file_fast(conn->sock, conn->cmd_buffer + 15);
+        close_connection(conn);
+        return;
+    }
+    if (strncmp(conn->cmd_buffer, "HASH_FILE_B3 ", 13) == 0) {
+        handle_hash_file_b3(conn->sock, conn->cmd_buffer + 13);
+        close_connection(conn);
+        return;
+    }
     if (strncmp(conn->cmd_buffer, "VERSION", 7) == 0) {
         handle_version(conn->sock);
+        close_connection(conn);
+        return;
+    }
+    if (strncmp(conn->cmd_buffer, "CAPS", 4) == 0) {
+        handle_caps(conn->sock);
         close_connection(conn);
         return;
     }
@@ -2029,7 +2044,7 @@ static void process_command(struct ClientConnection *conn) {
         return;
     }
     if (strncmp(conn->cmd_buffer, "UPLOAD_RAR_SAFE ", 16) == 0) {
-        handle_upload_rar(conn->sock, conn->cmd_buffer + 16, UNRAR_MODE_TURBO);
+        handle_upload_rar(conn->sock, conn->cmd_buffer + 16, UNRAR_MODE_SAFE);
         close_connection(conn);
         return;
     }

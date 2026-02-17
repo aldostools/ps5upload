@@ -3012,6 +3012,31 @@ export default function App() {
 
   useEffect(() => {
     let mounted = true;
+    let payloadDownloadFlushTimer: ReturnType<typeof setTimeout> | null = null;
+    const payloadDownloadPending = new Map<
+      string,
+      {
+        received_bytes: number;
+        total_bytes: number | null;
+        speed_bps: number;
+        done: boolean;
+        error: string | null;
+        label: string | null;
+      }
+    >();
+
+    const flushPayloadDownload = () => {
+      if (!mounted || payloadDownloadPending.size === 0) return;
+      const updates = Array.from(payloadDownloadPending.entries());
+      payloadDownloadPending.clear();
+      setExternalPayloadDownloadProgress((prev) => {
+        const next = { ...prev };
+        for (const [sourceId, payload] of updates) {
+          next[sourceId] = payload;
+        }
+        return next;
+      });
+    };
     let timeout: ReturnType<typeof setTimeout> | null = null;
     const setup = async () => {
       const unlisten = await appWindow.onResized(async (event) => {
@@ -3690,18 +3715,20 @@ export default function App() {
         const payload = event.payload || {};
         const sourceId = payload.source_id ? String(payload.source_id).trim() : "";
         if (!sourceId) return;
-        setExternalPayloadDownloadProgress((prev) => ({
-          ...prev,
-          [sourceId]: {
-            received_bytes: Number(payload.received_bytes) || 0,
-            total_bytes:
-              payload.total_bytes == null ? null : Number(payload.total_bytes) || null,
-            speed_bps: Number(payload.speed_bps) || 0,
-            done: Boolean(payload.done),
-            error: payload.error ? String(payload.error) : null,
-            label: payload.label ? String(payload.label) : null
-          }
-        }));
+        payloadDownloadPending.set(sourceId, {
+          received_bytes: Number(payload.received_bytes) || 0,
+          total_bytes: payload.total_bytes == null ? null : Number(payload.total_bytes) || null,
+          speed_bps: Number(payload.speed_bps) || 0,
+          done: Boolean(payload.done),
+          error: payload.error ? String(payload.error) : null,
+          label: payload.label ? String(payload.label) : null
+        });
+        if (!payloadDownloadFlushTimer) {
+          payloadDownloadFlushTimer = window.setTimeout(() => {
+            payloadDownloadFlushTimer = null;
+            flushPayloadDownload();
+          }, 100);
+        }
       });
 
       const unlistenPayloadDone = await listen<{
@@ -4081,6 +4108,11 @@ export default function App() {
           clearTimeout(payloadLogFlush.current);
           payloadLogFlush.current = null;
         }
+        if (payloadDownloadFlushTimer) {
+          clearTimeout(payloadDownloadFlushTimer);
+          payloadDownloadFlushTimer = null;
+        }
+        flushPayloadDownload();
         unlistenComplete();
         unlistenError();
         unlistenLog();
@@ -5738,33 +5770,6 @@ export default function App() {
       items: queueData.items.filter((item) => !isUploadFailed(item))
     };
     await saveQueueData(nextQueue);
-  };
-
-  const handleRetryStoppedQueue = async () => {
-    const stopped = queueData.items.filter((item) => isUploadFailed(item));
-    if (stopped.length === 0) return;
-    const nextItems = queueData.items.map((item) => {
-      if (!isUploadFailed(item)) return item;
-      const resumeSupported = !isArchivePath(item.source_path);
-      const nextSettings = {
-        ...(item.transfer_settings || {}),
-        // Avoid immediate "already exists" failures on retries.
-        override_on_conflict: true,
-        resume_mode: resumeSupported ? "size" : "none"
-      };
-      return {
-        ...item,
-        status: "Pending",
-        paused: false,
-        last_run_action: resumeSupported ? "resume" : "requeue",
-        transfer_settings: nextSettings
-      };
-    });
-    await saveQueueData({ ...queueData, items: nextItems });
-    pushClientLog(`Retried ${stopped.length} stopped item(s).`);
-    if (uploadQueueRunning && !transferActive) {
-      processNextQueueItem();
-    }
   };
 
   const handleClearQueue = async () => {
@@ -8610,13 +8615,6 @@ export default function App() {
                     disabled={!uploadQueueRunning && !transferBusy}
                   >
                     {tr("stop")}
-                  </button>
-                  <button
-                    className="btn info"
-                    onClick={handleRetryStoppedQueue}
-                    disabled={!hasUploadFailed || transferBusy}
-                  >
-                    {tr("retry_stopped")}
                   </button>
                   <button className="btn" onClick={handleRefreshUploadQueue}>
                     {tr("refresh")}

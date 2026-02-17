@@ -39,6 +39,8 @@
 #include "zstd.h"
 #include "LzmaLib.h"
 #include "sha256.h"
+#include "blake3.h"
+#include "xxhash.h"
 #include "third_party/unrar/unrar_wrapper.h"
 #include "extract_queue.h"
 
@@ -59,6 +61,7 @@ static time_t get_file_mtime(const char *path);
 static int write_text_file(const char *path, const char *data, size_t len);
 static char *read_text_file(const char *path, size_t *out_len);
 static int parse_quoted_token(const char *src, char *out, size_t out_cap, const char **rest);
+static int open_hash_target_file(const char *path_arg, char *path_out, size_t path_out_len, FILE **fp_out);
 
 static int begin_download_raw_session(void) {
     int cur = atomic_load(&g_download_raw_active);
@@ -161,6 +164,32 @@ static void trim_newline(char *path) {
         path[len - 1] = '\0';
         len--;
     }
+}
+
+static int open_hash_target_file(const char *path_arg, char *path_out, size_t path_out_len, FILE **fp_out) {
+    if (!path_arg || !path_out || path_out_len == 0 || !fp_out) {
+        return -1;
+    }
+    strncpy(path_out, path_arg, path_out_len - 1);
+    path_out[path_out_len - 1] = '\0';
+    trim_newline(path_out);
+
+    if (!is_path_safe(path_out)) {
+        return -1;
+    }
+
+    struct stat st;
+    if (stat(path_out, &st) != 0 || !S_ISREG(st.st_mode)) {
+        return -1;
+    }
+
+    FILE *fp = fopen(path_out, "rb");
+    if (!fp) {
+        return -1;
+    }
+
+    *fp_out = fp;
+    return 0;
 }
 
 
@@ -2336,32 +2365,12 @@ void handle_download_dir(int client_sock, const char *path_arg) {
 
 void handle_hash_file(int client_sock, const char *path_arg) {
     char path[PATH_MAX];
-    strncpy(path, path_arg, PATH_MAX - 1);
-    path[PATH_MAX - 1] = '\0';
-    trim_newline(path);
-
-    if (!is_path_safe(path)) {
-        const char *error = "ERROR: Invalid path\n";
+    FILE *fp = NULL;
+    if (open_hash_target_file(path_arg, path, sizeof(path), &fp) != 0) {
+        const char *error = "ERROR: Invalid hash target\n";
         send(client_sock, error, strlen(error), 0);
         return;
     }
-
-    struct stat st;
-    if (stat(path, &st) != 0 || !S_ISREG(st.st_mode)) {
-        char error_msg[320];
-        snprintf(error_msg, sizeof(error_msg), "ERROR: Not a file\n");
-        send(client_sock, error_msg, strlen(error_msg), 0);
-        return;
-    }
-
-    FILE *fp = fopen(path, "rb");
-    if (!fp) {
-        char error_msg[320];
-        snprintf(error_msg, sizeof(error_msg), "ERROR: Failed to open\n");
-        send(client_sock, error_msg, strlen(error_msg), 0);
-        return;
-    }
-
     Sha256Ctx ctx;
     sha256_init(&ctx);
 
@@ -2378,6 +2387,13 @@ void handle_hash_file(int client_sock, const char *path_arg) {
     size_t n = 0;
     while ((n = fread(buffer, 1, bufsize, fp)) > 0) {
         sha256_update(&ctx, buffer, n);
+    }
+    if (ferror(fp)) {
+        const char *error = "ERROR: Read failed\n";
+        send(client_sock, error, strlen(error), 0);
+        free(buffer);
+        fclose(fp);
+        return;
     }
     free(buffer);
     fclose(fp);
@@ -2396,10 +2412,151 @@ void handle_hash_file(int client_sock, const char *path_arg) {
     send(client_sock, msg, strlen(msg), 0);
 }
 
+void handle_hash_file_fast(int client_sock, const char *path_arg) {
+    char path[PATH_MAX];
+    FILE *fp = NULL;
+    if (open_hash_target_file(path_arg, path, sizeof(path), &fp) != 0) {
+        const char *error = "ERROR: Invalid hash target\n";
+        send(client_sock, error, strlen(error), 0);
+        return;
+    }
+
+    const size_t bufsize = 64 * 1024;
+    uint8_t *buffer = (uint8_t *)malloc(bufsize);
+    if (!buffer) {
+        const char *error = "ERROR: malloc failed\n";
+        send(client_sock, error, strlen(error), 0);
+        fclose(fp);
+        return;
+    }
+    XXH64_state_t *xxh = XXH64_createState();
+    if (!xxh) {
+        const char *error = "ERROR: xxhash init failed\n";
+        send(client_sock, error, strlen(error), 0);
+        free(buffer);
+        fclose(fp);
+        return;
+    }
+    if (XXH64_reset(xxh, 0) != XXH_OK) {
+        const char *error = "ERROR: xxhash reset failed\n";
+        send(client_sock, error, strlen(error), 0);
+        XXH64_freeState(xxh);
+        free(buffer);
+        fclose(fp);
+        return;
+    }
+
+    size_t n = 0;
+    while ((n = fread(buffer, 1, bufsize, fp)) > 0) {
+        if (XXH64_update(xxh, buffer, n) != XXH_OK) {
+            const char *error = "ERROR: xxhash update failed\n";
+            send(client_sock, error, strlen(error), 0);
+            XXH64_freeState(xxh);
+            free(buffer);
+            fclose(fp);
+            return;
+        }
+    }
+    if (ferror(fp)) {
+        const char *error = "ERROR: Read failed\n";
+        send(client_sock, error, strlen(error), 0);
+        XXH64_freeState(xxh);
+        free(buffer);
+        fclose(fp);
+        return;
+    }
+    unsigned long long hash = XXH64_digest(xxh);
+    XXH64_freeState(xxh);
+    free(buffer);
+    fclose(fp);
+
+    char msg[64];
+    snprintf(msg, sizeof(msg), "OK %016llx\n", hash);
+    send(client_sock, msg, strlen(msg), 0);
+}
+
+void handle_hash_file_b3(int client_sock, const char *path_arg) {
+    char path[PATH_MAX];
+    FILE *fp = NULL;
+    if (open_hash_target_file(path_arg, path, sizeof(path), &fp) != 0) {
+        const char *error = "ERROR: Invalid hash target\n";
+        send(client_sock, error, strlen(error), 0);
+        return;
+    }
+
+    const size_t bufsize = 64 * 1024;
+    uint8_t *buffer = (uint8_t *)malloc(bufsize);
+    if (!buffer) {
+        const char *error = "ERROR: malloc failed\n";
+        send(client_sock, error, strlen(error), 0);
+        fclose(fp);
+        return;
+    }
+
+    blake3_hasher hasher;
+    blake3_hasher_init(&hasher);
+
+    size_t n = 0;
+    while ((n = fread(buffer, 1, bufsize, fp)) > 0) {
+        blake3_hasher_update(&hasher, buffer, n);
+    }
+    if (ferror(fp)) {
+        const char *error = "ERROR: Read failed\n";
+        send(client_sock, error, strlen(error), 0);
+        free(buffer);
+        fclose(fp);
+        return;
+    }
+    free(buffer);
+    fclose(fp);
+
+    uint8_t hash[BLAKE3_OUT_LEN];
+    blake3_hasher_finalize(&hasher, hash, sizeof(hash));
+    char hex[(BLAKE3_OUT_LEN * 2) + 1];
+    for (int i = 0; i < BLAKE3_OUT_LEN; i++) {
+        snprintf(hex + (i * 2), 3, "%02x", hash[i]);
+    }
+    hex[BLAKE3_OUT_LEN * 2] = '\0';
+
+    char msg[96];
+    snprintf(msg, sizeof(msg), "OK %s\n", hex);
+    send(client_sock, msg, strlen(msg), 0);
+}
+
 void handle_version(int client_sock) {
     char msg[64];
     snprintf(msg, sizeof(msg), "VERSION %s\n", PS5_UPLOAD_VERSION);
     send_all(client_sock, msg, strlen(msg));
+}
+
+void handle_caps(int client_sock) {
+    const char *json_template =
+        "{\"schema_version\":2,\"source\":\"payload\",\"payload_version\":\"%s\","
+        "\"firmware\":null,"
+        "\"features\":{\"status\":true,\"queue\":true,\"queue_extract\":true,"
+        "\"queue_extract_auto\":true,\"upload_queue_sync\":true,\"history_sync\":true,"
+        "\"maintenance\":true,\"chmod\":true,\"games_scan_meta\":true,"
+        "\"hash_sha256\":true,\"hash_fast\":true,\"hash_blake3\":true},"
+        "\"limits\":{\"queue_max_items\":%d},"
+        "\"commands\":[\"VERSION\",\"CAPS\",\"PAYLOAD_STATUS\","
+        "\"HASH_FILE\",\"HASH_FILE_FAST\",\"HASH_FILE_B3\","
+        "\"QUEUE_EXTRACT\",\"QUEUE_CANCEL\",\"QUEUE_CLEAR\",\"QUEUE_CLEAR_ALL\","
+        "\"QUEUE_CLEAR_FAILED\",\"QUEUE_REORDER\",\"QUEUE_PROCESS\",\"QUEUE_PAUSE\","
+        "\"QUEUE_RETRY\",\"QUEUE_REMOVE\",\"UPLOAD_QUEUE_GET\",\"UPLOAD_QUEUE_SYNC\","
+        "\"HISTORY_GET\",\"HISTORY_SYNC\",\"MAINTENANCE\",\"CHMOD777\"],"
+        "\"notes\":[]}";
+    char json[2048];
+    int len = snprintf(json, sizeof(json), json_template, PS5_UPLOAD_VERSION, EXTRACT_QUEUE_MAX_ITEMS);
+    if (len <= 0 || (size_t)len >= sizeof(json)) {
+        const char *error = "ERROR: Failed to build caps payload\n";
+        send(client_sock, error, strlen(error), 0);
+        return;
+    }
+    char header[64];
+    int hdr_len = snprintf(header, sizeof(header), "OK %d\n", len);
+    send_all(client_sock, header, (size_t)hdr_len);
+    send_all(client_sock, json, (size_t)len);
+    send_all(client_sock, "\n", 1);
 }
 
 void handle_get_space(int client_sock, const char *path_arg) {
@@ -3008,15 +3165,48 @@ void handle_queue_extract(int client_sock, const char *args) {
     }
 
     int delete_source = 0;
-    int unrar_mode = EXTRACT_RAR_TURBO;
+    int unrar_mode = EXTRACT_RAR_AUTO;
     if (flags && flags[0]) {
-        for (char *p = flags; *p; p++) {
-            if (*p >= 'a' && *p <= 'z') {
-                *p = (char)(*p - ('a' - 'A'));
+        char normalized[256];
+        size_t ni = 0;
+        normalized[ni++] = ' ';
+        for (char *p = flags; *p && ni + 2 < sizeof(normalized); p++) {
+            char c = *p;
+            if (c >= 'a' && c <= 'z') {
+                c = (char)(c - ('a' - 'A'));
             }
+            if (c == ',' || c == '+' || c == ';' || c == '|') {
+                c = ' ';
+            }
+            normalized[ni++] = c;
         }
-        if (strstr(flags, "DEL") || strstr(flags, "DELETE")) {
+        normalized[ni++] = ' ';
+        normalized[ni] = '\0';
+
+        if (strstr(normalized, " DEL ") || strstr(normalized, " DELETE ")) {
             delete_source = 1;
+        }
+        int mode_hits = 0;
+        if (strstr(normalized, " RAR_SAFE ") || strstr(normalized, " SAFE ")) {
+            unrar_mode = EXTRACT_RAR_SAFE;
+            mode_hits++;
+        }
+        if (strstr(normalized, " RAR_FAST ") || strstr(normalized, " FAST ")) {
+            unrar_mode = EXTRACT_RAR_FAST;
+            mode_hits++;
+        }
+        if (strstr(normalized, " RAR_TURBO ") || strstr(normalized, " TURBO ")) {
+            unrar_mode = EXTRACT_RAR_TURBO;
+            mode_hits++;
+        }
+        if (strstr(normalized, " RAR_AUTO ") || strstr(normalized, " AUTO ")) {
+            unrar_mode = EXTRACT_RAR_AUTO;
+            mode_hits++;
+        }
+        if (mode_hits > 1) {
+            const char *error = "ERROR: Conflicting RAR mode flags\n";
+            send(client_sock, error, strlen(error), 0);
+            return;
         }
     }
 

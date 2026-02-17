@@ -250,7 +250,6 @@ const translations = {
     resume_slow: "Slow - verify SHA256",
 
     // Queues
-    retry_stopped: "Retry stopped",
     resume_note: "Resume only works if source and destination are unchanged.",
     resume_override_note: "Resume ignores existing files; override is disabled while resume is on.",
     resume_note_change: "Changing either path disables reliable resume.",

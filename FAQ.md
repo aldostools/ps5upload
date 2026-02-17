@@ -141,7 +141,7 @@ Update to **v1.3.6** or newer. We bundle Noto fonts so Hindi/Bengali/Thai/Korean
 ### Upload Modes (Payload / FTP / Mix)
 **Q: What’s the difference between Payload, FTP, and Mix?**  
 - **Payload:** Streams packed data directly to the PS5 via the payload. Best for many small files.
-- **FTP:** Uses FTP for file-by-file uploads. Reliable and compatible with standard FTP workflows. Requires ftpsrv or the etaHEN FTP service enabled.
+- **FTP:** Uses FTP for file-by-file uploads. Reliable and compatible with standard FTP workflows. Requires ftpsrv or the etaHEN FTP service enabled. Client enforces binary mode (`TYPE I`) so uploads stay byte-accurate.
 - **Mix:** Runs both at once. Payload always pulls the **smallest** remaining file, FTP always pulls the **largest** remaining file, and both keep going until they meet. No threshold and no duplicate uploads.
 
 **Q: If one side fails in Mix, what happens?**  
@@ -169,6 +169,7 @@ Mad Max is an aggressive single-file upload profile. It can improve throughput o
 
 **Q: How do uploads recover from payload hiccups?**  
 The client uses Upload V4, which includes per‑pack ACKs and a replay window. If the payload stalls or restarts, the client waits for it to recover (short window), then resumes by checking which files already exist and re-uploading only what’s missing.
+Payload upload bytes are transferred as binary frames (not text/ASCII conversion), and app/desktop share the same transport core for this path.
 
 ### Best Speed (Direct Ethernet)
 **Q: How do I get the fastest transfer speeds?**  
@@ -254,7 +255,7 @@ Stop retries automatically—no need to click multiple times.
 ## Archives & Extraction
 
 **Q: How does RAR extraction work?**  
-RAR extraction runs in a single turbo mode for maximum speed. The archive is uploaded to a temp folder and extracted on the PS5.  
+RAR extraction keeps the requested queue mode (`FAST` / `SAFE` / `TURBO`). The archive is uploaded to a temp folder and extracted on the PS5.  
 If **RAR Temp Storage** is set, the temp folder is `<selected storage>/ps5upload/tmp` (e.g. `/mnt/usb0/ps5upload/tmp`); otherwise it uses the destination’s storage root.  
 This requires a payload that supports the TMP override (older payloads will ignore the selection).
 
@@ -320,6 +321,10 @@ Start the extraction queue, refresh, or **Clear tmp**.
 
 **“Connection refused / timed out”**  
 Reload the payload and reconnect.
+
+**“Invalid JSON response”**  
+Update to the latest app/desktop build and payload, then restart both sides.  
+This usually comes from client/payload version mismatch (older clients may only read the first line of payload list responses).
 
 **“api.gamesScanStats is not a function”**  
 Restart the desktop app after updating. This means the preload bridge is stale and still using the old API surface.
